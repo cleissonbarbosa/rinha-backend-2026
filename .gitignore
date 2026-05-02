@@ -2,9 +2,11 @@
 *.log
 *.tmp
 *.bin
+.build/
 nimcache/
 .nimble/
 test/results.json
 resources/references.json
 resources/references.json.gz
+/data/
 
