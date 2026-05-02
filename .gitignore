@@ -1,0 +1,10 @@
+.env
+*.log
+*.tmp
+*.bin
+nimcache/
+.nimble/
+test/results.json
+resources/references.json
+resources/references.json.gz
+
