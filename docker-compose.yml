@@ -14,8 +14,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.05"
-          memory: "10MB"
+          cpus: "0.20"
+          memory: "16MB"
 
   api1:
     build: .
@@ -26,14 +26,14 @@ services:
       - VECTORS_PATH=/data/vectors.bin
       - LABELS_PATH=/data/labels.bin
       - IVF_PATH=/data/ivf.bin
-      - HTTP_THREADS=2
+      - HTTP_THREADS=1
     networks:
       - rinha
     deploy:
       resources:
         limits:
-          cpus: "0.475"
-          memory: "170MB"
+          cpus: "0.40"
+          memory: "167MB"
 
   api2:
     build: .
@@ -44,14 +44,14 @@ services:
       - VECTORS_PATH=/data/vectors.bin
       - LABELS_PATH=/data/labels.bin
       - IVF_PATH=/data/ivf.bin
-      - HTTP_THREADS=2
+      - HTTP_THREADS=1
     networks:
       - rinha
     deploy:
       resources:
         limits:
-          cpus: "0.475"
-          memory: "170MB"
+          cpus: "0.40"
+          memory: "167MB"
 
 networks:
   rinha:

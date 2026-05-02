@@ -1,18 +1,12 @@
-
-
-
-
-
-
 import std/[os, math, memfiles, strutils]
 
 const D = 14
 const ExpectedN = 3_000_000
-const DefaultIvfClusters = 2048
-const DefaultIvfNProbe = 10
+const DefaultIvfClusters = 4096
+const DefaultIvfNProbe = 16
 const MaxIvfNProbe = 64
 const DefaultIvfSample = 65_536
-const DefaultIvfIterations = 20
+const DefaultIvfIterations = 25
 
 const IvfMagic = "RIVF2026"
 
