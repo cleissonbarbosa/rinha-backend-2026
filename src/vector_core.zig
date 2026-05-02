@@ -63,8 +63,7 @@ fn mmapRO(path: []const u8, expected_align: usize) ![]align(std.mem.page_size) c
     asm volatile (""
         :
         : [s] "r" (fault_sink),
-        : "memory"
-    );
+        : "memory");
 
     return mem[0..size];
 }
@@ -152,8 +151,63 @@ inline fn insertProbe(top_dist: *[MAX_NPROBE]f32, top_idx: *[MAX_NPROBE]u32, lim
 inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[K]f32, top_idx: *[K]u32) void {
     const dims_ptr = dims_data;
     const n = n_vecs;
+    const STRIDE = VLEN * 2; // Process 32 vectors per iteration
 
     var offset = start;
+    while (offset + STRIDE <= end) : (offset += STRIDE) {
+        var dist_0: Vec32 = @splat(@as(f32, 0.0));
+        var dist_1: Vec32 = @splat(@as(f32, 0.0));
+        var dist_2: Vec32 = @splat(@as(f32, 0.0));
+        var dist_3: Vec32 = @splat(@as(f32, 0.0));
+
+        comptime var d: usize = 0;
+        inline while (d < D) : (d += 1) {
+            const dim_base = dims_ptr + d * n;
+            const q: Vec32 = @splat(query.*[d]);
+
+            const p0: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset);
+            const p1: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + AVX2_LANES);
+            const p2: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + VLEN);
+            const p3: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + VLEN + AVX2_LANES);
+
+            const v0_16: Vec16 = p0.*;
+            const v1_16: Vec16 = p1.*;
+            const v2_16: Vec16 = p2.*;
+            const v3_16: Vec16 = p3.*;
+            const v0: Vec32 = @floatCast(v0_16);
+            const v1: Vec32 = @floatCast(v1_16);
+            const v2: Vec32 = @floatCast(v2_16);
+            const v3: Vec32 = @floatCast(v3_16);
+            const d0 = q - v0;
+            const d1 = q - v1;
+            const d2 = q - v2;
+            const d3 = q - v3;
+
+            dist_0 = @mulAdd(Vec32, d0, d0, dist_0);
+            dist_1 = @mulAdd(Vec32, d1, d1, dist_1);
+            dist_2 = @mulAdd(Vec32, d2, d2, dist_2);
+            dist_3 = @mulAdd(Vec32, d3, d3, dist_3);
+        }
+
+        comptime var k: usize = 0;
+        inline while (k < AVX2_LANES) : (k += 1) {
+            insertTop(top_dist, top_idx, @intCast(offset + k), dist_0[k]);
+        }
+        comptime var k1: usize = 0;
+        inline while (k1 < AVX2_LANES) : (k1 += 1) {
+            insertTop(top_dist, top_idx, @intCast(offset + AVX2_LANES + k1), dist_1[k1]);
+        }
+        comptime var k2: usize = 0;
+        inline while (k2 < AVX2_LANES) : (k2 += 1) {
+            insertTop(top_dist, top_idx, @intCast(offset + VLEN + k2), dist_2[k2]);
+        }
+        comptime var k3: usize = 0;
+        inline while (k3 < AVX2_LANES) : (k3 += 1) {
+            insertTop(top_dist, top_idx, @intCast(offset + VLEN + AVX2_LANES + k3), dist_3[k3]);
+        }
+    }
+
+    // Handle remaining 16-vector blocks
     while (offset + VLEN <= end) : (offset += VLEN) {
         var dist_lo: Vec32 = @splat(@as(f32, 0.0));
         var dist_hi: Vec32 = @splat(@as(f32, 0.0));
@@ -178,7 +232,6 @@ inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[
         inline while (k < AVX2_LANES) : (k += 1) {
             insertTop(top_dist, top_idx, @intCast(offset + k), dist_lo[k]);
         }
-
         comptime var h: usize = 0;
         inline while (h < AVX2_LANES) : (h += 1) {
             insertTop(top_dist, top_idx, @intCast(offset + AVX2_LANES + h), dist_hi[h]);
@@ -218,7 +271,35 @@ export fn vc_query(query_ptr: [*]const f32) c_int {
     var probe_dist = [_]f32{std.math.inf(f32)} ** MAX_NPROBE;
     var probe_idx = [_]u32{0} ** MAX_NPROBE;
 
+    // Centroid search: process 4 clusters at a time for better ILP
+    const cluster_count_aligned = cluster_count & ~@as(usize, 3);
     var c: usize = 0;
+    while (c < cluster_count_aligned) : (c += 4) {
+        var d0: f32 = 0.0;
+        var d1: f32 = 0.0;
+        var d2: f32 = 0.0;
+        var d3: f32 = 0.0;
+        const b0 = c * D;
+        const b1 = (c + 1) * D;
+        const b2 = (c + 2) * D;
+        const b3 = (c + 3) * D;
+        comptime var dd: usize = 0;
+        inline while (dd < D) : (dd += 1) {
+            const q = query[dd];
+            const diff0 = q - centroids_ptr[b0 + dd];
+            const diff1 = q - centroids_ptr[b1 + dd];
+            const diff2 = q - centroids_ptr[b2 + dd];
+            const diff3 = q - centroids_ptr[b3 + dd];
+            d0 += diff0 * diff0;
+            d1 += diff1 * diff1;
+            d2 += diff2 * diff2;
+            d3 += diff3 * diff3;
+        }
+        insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c), d0);
+        insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c + 1), d1);
+        insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c + 2), d2);
+        insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c + 3), d3);
+    }
     while (c < cluster_count) : (c += 1) {
         const base = c * D;
         var dist: f32 = 0.0;
