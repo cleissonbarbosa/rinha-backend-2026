@@ -1,7 +1,7 @@
 {
-  "participants": ["cleissonb"],
-  "social": ["https://github.com/cleissonb"],
-  "source-code-repo": "https://github.com/cleissonb/rinha-backend-2026",
+  "participants": ["cleissonbarbosa"],
+  "social": ["https://github.com/cleissonbarbosa"],
+  "source-code-repo": "https://github.com/cleissonbarbosa/rinha-backend-2026",
   "stack": ["nim", "zig", "nginx"],
   "open_to_work": false
 }
