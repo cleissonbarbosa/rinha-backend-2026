@@ -1,12 +1,31 @@
-## Build-time preprocessor.
-## Reads references.json (decompressed) and writes:
-##   vectors.bin -- D arrays of N float16 values, SoA layout
-##   labels.bin  -- N bytes (1 = fraud, 0 = legit)
 
-import std/[os, math, memfiles]
+
+
+
+
+
+import std/[os, math, memfiles, strutils]
 
 const D = 14
 const ExpectedN = 3_000_000
+const DefaultIvfClusters = 2048
+const DefaultIvfNProbe = 10
+const MaxIvfNProbe = 64
+const DefaultIvfSample = 65_536
+const DefaultIvfIterations = 20
+
+const IvfMagic = "RIVF2026"
+
+proc envInt(name: string; defaultValue: int): int =
+  let raw = getEnv(name, "")
+  if raw.len == 0:
+    return defaultValue
+  try:
+    result = parseInt(raw)
+    if result <= 0:
+      result = defaultValue
+  except ValueError:
+    result = defaultValue
 
 proc f32ToF16(x: float32): uint16 =
   let bits = cast[uint32](x)
@@ -18,21 +37,21 @@ proc f32ToF16(x: float32): uint16 =
     if mantissa == 0:
       return sign or 0x7c00'u16
     else:
-      return sign or 0x7e00'u16  # qNaN
+      return sign or 0x7e00'u16  
 
   if expField == 0:
-    return sign  # zero or subnormal in f32 -> zero in f16
+    return sign  
 
   let unbiased = expField - 127
 
   if unbiased > 15:
-    return sign or 0x7c00'u16  # overflow -> Inf
+    return sign or 0x7c00'u16  
 
   if unbiased < -24:
-    return sign  # underflow -> 0
+    return sign  
 
   if unbiased < -14:
-    # Subnormal in f16
+    
     let shift = -14 - unbiased
     let m = (mantissa or 0x800000'u32) shr (uint32(13 + shift))
     let half = 1'u32 shl uint32(12 + shift)
@@ -56,8 +75,253 @@ proc f32ToF16(x: float32): uint16 =
     mantOut = 0
     expOut += 0x400'u32
   if (expOut shr 10) >= 0x1f'u32:
-    return sign or 0x7c00'u16  # overflow to Inf
+    return sign or 0x7c00'u16  
   return sign or uint16((expOut or mantOut) and 0x7fff'u32)
+
+proc f16ToF32(h: uint16): float32 {.inline.} =
+  let sign = uint32(h and 0x8000'u16) shl 16
+  let exp = int((h shr 10) and 0x1f'u16)
+  let mant = uint32(h and 0x03ff'u16)
+
+  var bits: uint32
+  if exp == 0:
+    if mant == 0'u32:
+      bits = sign
+    else:
+      var m = mant
+      var e = -14
+      while (m and 0x0400'u32) == 0'u32:
+        m = m shl 1
+        dec e
+      m = m and 0x03ff'u32
+      let exp32 = uint32(e + 127) shl 23
+      bits = sign or exp32 or (m shl 13)
+  elif exp == 0x1f:
+    bits = sign or 0x7f800000'u32 or (mant shl 13)
+  else:
+    let exp32 = uint32(exp - 15 + 127) shl 23
+    bits = sign or exp32 or (mant shl 13)
+  cast[float32](bits)
+
+proc writeU32LE(f: File; value: uint32) =
+  var bytes: array[4, uint8]
+  bytes[0] = uint8(value and 0xff'u32)
+  bytes[1] = uint8((value shr 8) and 0xff'u32)
+  bytes[2] = uint8((value shr 16) and 0xff'u32)
+  bytes[3] = uint8((value shr 24) and 0xff'u32)
+  if f.writeBuffer(addr bytes[0], 4) != 4:
+    quit("short write while writing u32", 1)
+
+proc writeF32LE(f: File; value: float32) {.inline.} =
+  writeU32LE(f, cast[uint32](value))
+
+proc nearestCentroidSample(
+  sample: seq[float32];
+  sampleOffset: int;
+  centroids: seq[float32];
+  clusterCount: int
+): int {.inline.} =
+  var best = 0
+  var bestDist = 1.0e30'f32
+  var c = 0
+  while c < clusterCount:
+    let base = c * D
+    var dist = 0.0'f32
+    var d = 0
+    while d < D:
+      let diff = sample[sampleOffset + d] - centroids[base + d]
+      dist += diff * diff
+      inc d
+    if dist < bestDist:
+      bestDist = dist
+      best = c
+    inc c
+  best
+
+proc nearestCentroidVector(
+  vectors: var array[D, seq[uint16]];
+  idx: int;
+  centroids: seq[float32];
+  clusterCount: int
+): int {.inline.} =
+  var point: array[D, float32]
+  var d = 0
+  while d < D:
+    point[d] = f16ToF32(vectors[d][idx])
+    inc d
+
+  var best = 0
+  var bestDist = 1.0e30'f32
+  var c = 0
+  while c < clusterCount:
+    let base = c * D
+    var dist = 0.0'f32
+    d = 0
+    while d < D:
+      let diff = point[d] - centroids[base + d]
+      dist += diff * diff
+      inc d
+    if dist < bestDist:
+      bestDist = dist
+      best = c
+    inc c
+  best
+
+proc trainIvf(
+  vectors: var array[D, seq[uint16]];
+  n: int;
+  clusterCount: int;
+  sampleCountWanted: int;
+  iterations: int
+): seq[float32] =
+  let sampleCount = min(n, max(clusterCount, sampleCountWanted))
+  echo "training IVF: clusters=", clusterCount,
+       " sample=", sampleCount,
+       " iterations=", iterations
+
+  var sample = newSeq[float32](sampleCount * D)
+  var seed = 0x9e3779b97f4a7c15'u64
+  var s = 0
+  while s < sampleCount:
+    seed = seed * 2862933555777941757'u64 + 3037000493'u64
+    let idx = int(seed mod uint64(n))
+    var d = 0
+    while d < D:
+      sample[s * D + d] = f16ToF32(vectors[d][idx])
+      inc d
+    inc s
+
+  var centroids = newSeq[float32](clusterCount * D)
+  var c = 0
+  while c < clusterCount:
+    let sampleBase = ((c * sampleCount) div clusterCount) * D
+    let dstBase = c * D
+    var d = 0
+    while d < D:
+      centroids[dstBase + d] = sample[sampleBase + d]
+      inc d
+    inc c
+
+  var sums = newSeq[float32](clusterCount * D)
+  var counts = newSeq[int](clusterCount)
+  var iter = 0
+  while iter < iterations:
+    var i = 0
+    while i < sums.len:
+      sums[i] = 0.0'f32
+      inc i
+    i = 0
+    while i < counts.len:
+      counts[i] = 0
+      inc i
+
+    s = 0
+    while s < sampleCount:
+      let sampleOffset = s * D
+      let nearest = nearestCentroidSample(sample, sampleOffset, centroids, clusterCount)
+      inc counts[nearest]
+      let base = nearest * D
+      var d = 0
+      while d < D:
+        sums[base + d] += sample[sampleOffset + d]
+        inc d
+      inc s
+
+    c = 0
+    while c < clusterCount:
+      let base = c * D
+      if counts[c] > 0:
+        let inv = 1.0'f32 / float32(counts[c])
+        var d = 0
+        while d < D:
+          centroids[base + d] = sums[base + d] * inv
+          inc d
+      else:
+        let sampleBase = (((iter + 1) * 131 + c * 17) mod sampleCount) * D
+        var d = 0
+        while d < D:
+          centroids[base + d] = sample[sampleBase + d]
+          inc d
+      inc c
+
+    echo "  kmeans iteration ", iter + 1, "/", iterations
+    inc iter
+
+  centroids
+
+proc buildAssignments(
+  vectors: var array[D, seq[uint16]];
+  n: int;
+  centroids: var seq[float32];
+  clusterCount: int
+): tuple[assignments: seq[uint16], boundaries: seq[uint32]] =
+  echo "assigning ", n, " vectors to IVF clusters"
+  var assignments = newSeq[uint16](n)
+  var counts = newSeq[int](clusterCount)
+  var sums = newSeq[float32](clusterCount * D)
+
+  var i = 0
+  while i < n:
+    let nearest = nearestCentroidVector(vectors, i, centroids, clusterCount)
+    assignments[i] = uint16(nearest)
+    inc counts[nearest]
+    let base = nearest * D
+    var d = 0
+    while d < D:
+      sums[base + d] += f16ToF32(vectors[d][i])
+      inc d
+    inc i
+    if (i mod 250_000) == 0:
+      echo "  assigned ", i, " vectors"
+
+  var boundaries = newSeq[uint32](clusterCount + 1)
+  var running = 0
+  var c = 0
+  while c < clusterCount:
+    boundaries[c] = uint32(running)
+    running += counts[c]
+
+    let base = c * D
+    if counts[c] > 0:
+      let inv = 1.0'f32 / float32(counts[c])
+      var d = 0
+      while d < D:
+        centroids[base + d] = sums[base + d] * inv
+        inc d
+    inc c
+  boundaries[clusterCount] = uint32(running)
+  if running != n:
+    quit("assignment count mismatch", 1)
+
+  (assignments, boundaries)
+
+proc writeIvfIndex(
+  outPath: string;
+  centroids: seq[float32];
+  boundaries: seq[uint32];
+  clusterCount: int;
+  nprobe: int;
+  n: int
+) =
+  echo "writing ", outPath,
+       " (", centroids.len * 4 + boundaries.len * 4 + 28, " bytes)"
+  var outIdx = system.open(outPath, fmWrite)
+  outIdx.write(IvfMagic)
+  writeU32LE(outIdx, uint32(D))
+  writeU32LE(outIdx, uint32(clusterCount))
+  writeU32LE(outIdx, uint32(nprobe))
+  writeU32LE(outIdx, uint32(n))
+  writeU32LE(outIdx, 0'u32)
+
+  var i = 0
+  while i < centroids.len:
+    writeF32LE(outIdx, centroids[i])
+    inc i
+  i = 0
+  while i < boundaries.len:
+    writeU32LE(outIdx, boundaries[i])
+    inc i
+  outIdx.close()
 
 template skipWs(s: cstring; n: int; p: var int) =
   while p < n:
@@ -106,12 +370,20 @@ proc parseNumberFast(s: cstring; n: int; p: var int): float64 =
   sign * v
 
 proc main() =
-  if paramCount() != 3:
-    quit("usage: preprocess <input.json> <vectors.bin> <labels.bin>", 1)
+  if paramCount() != 4:
+    quit("usage: preprocess <input.json> <vectors.bin> <labels.bin> <ivf.bin>", 1)
 
   let inPath = paramStr(1)
   let outVecPath = paramStr(2)
   let outLblPath = paramStr(3)
+  let outIvfPath = paramStr(4)
+  let clusterCount = envInt("IVF_CLUSTERS", DefaultIvfClusters)
+  let nprobe = min(clusterCount, min(MaxIvfNProbe, envInt("IVF_NPROBE", DefaultIvfNProbe)))
+  let sampleCount = envInt("IVF_SAMPLE", DefaultIvfSample)
+  let iterations = envInt("IVF_ITERATIONS", DefaultIvfIterations)
+
+  if clusterCount > int(high(uint16)):
+    quit("IVF_CLUSTERS must fit in uint16", 1)
 
   echo "opening ", inPath
   var mf = memfiles.open(inPath, mode = fmRead)
@@ -166,7 +438,7 @@ proc main() =
       while p < total and raw[p] != '"':
         inc p
       let keyLen = p - keyStart
-      inc p  # closing quote
+      inc p  
 
       skipWs(raw, total, p)
       if p >= total or raw[p] != ':':
@@ -174,7 +446,7 @@ proc main() =
       inc p
 
       if keyLen == 6 and raw[keyStart] == 'v':
-        # "vector"
+        
         skipWs(raw, total, p)
         if raw[p] != '[':
           quit("expected vector array", 1)
@@ -194,12 +466,12 @@ proc main() =
           inc dimIdx
         sawVector = true
       elif keyLen == 5 and raw[keyStart] == 'l':
-        # "label"
+        
         skipWs(raw, total, p)
         if raw[p] != '"':
           quit("expected label string", 1)
         inc p
-        # First char tells us 'f' = fraud, 'l' = legit
+        
         if p < total and raw[p] == 'f':
           labelByte = 1'u8
         else:
@@ -209,7 +481,7 @@ proc main() =
         inc p
         sawLabel = true
       else:
-        # Unknown key - skip value (string, number, array, object, true, false, null)
+        
         skipWs(raw, total, p)
         let c = raw[p]
         if c == '"':
@@ -254,20 +526,49 @@ proc main() =
   if n == 0:
     quit("no records parsed", 1)
 
+  if clusterCount > n:
+    quit("IVF_CLUSTERS cannot exceed record count", 1)
+
+  var centroids = trainIvf(vectors, n, clusterCount, sampleCount, iterations)
+  let (assignments, boundaries) = buildAssignments(vectors, n, centroids, clusterCount)
+
   echo "writing ", outVecPath, " (", n * D * 2, " bytes)"
   var outVec = system.open(outVecPath, fmWrite)
+  var positions = newSeq[int](clusterCount)
+  var sortedDim = newSeq[uint16](n)
   for d in 0..<D:
-    let written = outVec.writeBuffer(addr vectors[d][0], n * 2)
+    for c in 0..<clusterCount:
+      positions[c] = int(boundaries[c])
+    var i = 0
+    while i < n:
+      let c = int(assignments[i])
+      let pos = positions[c]
+      sortedDim[pos] = vectors[d][i]
+      positions[c] = pos + 1
+      inc i
+    let written = outVec.writeBuffer(addr sortedDim[0], n * 2)
     if written != n * 2:
       quit("short write on vectors.bin", 1)
   outVec.close()
 
   echo "writing ", outLblPath, " (", n, " bytes)"
   var outLbl = system.open(outLblPath, fmWrite)
-  let writtenL = outLbl.writeBuffer(addr labels[0], n)
+  var sortedLabels = newSeq[uint8](n)
+  for c in 0..<clusterCount:
+    positions[c] = int(boundaries[c])
+  var i = 0
+  while i < n:
+    let c = int(assignments[i])
+    let pos = positions[c]
+    sortedLabels[pos] = labels[i]
+    positions[c] = pos + 1
+    inc i
+  let writtenL = outLbl.writeBuffer(addr sortedLabels[0], n)
   if writtenL != n:
     quit("short write on labels.bin", 1)
   outLbl.close()
+
+  writeIvfIndex(outIvfPath, centroids, boundaries, clusterCount, nprobe, n)
 
   mf.close()
   echo "done"

@@ -4,14 +4,32 @@ const posix = std.posix;
 
 const D: usize = 14;
 const K: usize = 5;
-const VLEN: usize = 8;
+const VLEN: usize = 16;
+const AVX2_LANES: usize = 8;
+const MAX_NPROBE: usize = 64;
+const IVF_MAGIC = "RIVF2026";
 
-const Vec32 = @Vector(VLEN, f32);
-const Vec16 = @Vector(VLEN, f16);
+const Vec32 = @Vector(AVX2_LANES, f32);
+const Vec16 = @Vector(AVX2_LANES, f16);
+
+comptime {
+    std.debug.assert(VLEN == AVX2_LANES * 2);
+}
 
 var n_vecs: usize = 0;
+var n_clusters: usize = 0;
+var nprobe: usize = 0;
 var dims_data: [*]align(64) const f16 = undefined;
 var labels_data: [*]const u8 = undefined;
+var centroids_data: [*]align(4) const f32 = undefined;
+var boundaries_data: [*]align(4) const u32 = undefined;
+
+inline fn readU32LE(mem: []align(std.mem.page_size) const u8, offset: usize) u32 {
+    return @as(u32, mem[offset]) |
+        (@as(u32, mem[offset + 1]) << 8) |
+        (@as(u32, mem[offset + 2]) << 16) |
+        (@as(u32, mem[offset + 3]) << 24);
+}
 
 fn mmapRO(path: []const u8, expected_align: usize) ![]align(std.mem.page_size) const u8 {
     _ = expected_align;
@@ -51,23 +69,51 @@ fn mmapRO(path: []const u8, expected_align: usize) ![]align(std.mem.page_size) c
     return mem[0..size];
 }
 
-fn initInternal(vec_path: []const u8, lbl_path: []const u8) !void {
+fn initInternal(vec_path: []const u8, lbl_path: []const u8, ivf_path: []const u8) !void {
     const lbl_mem = try mmapRO(lbl_path, 1);
     const vec_mem = try mmapRO(vec_path, 64);
+    const ivf_mem = try mmapRO(ivf_path, 4);
 
     const n = lbl_mem.len;
     if (vec_mem.len != D * n * @sizeOf(f16)) return error.SizeMismatch;
     if ((@intFromPtr(vec_mem.ptr) % 16) != 0) return error.Misaligned;
+    if (ivf_mem.len < IVF_MAGIC.len + 5 * @sizeOf(u32)) return error.BadIvfIndex;
+    if (!std.mem.eql(u8, ivf_mem[0..IVF_MAGIC.len], IVF_MAGIC)) return error.BadIvfIndex;
+
+    var off: usize = IVF_MAGIC.len;
+    const dim = readU32LE(ivf_mem, off);
+    off += 4;
+    const clusters = readU32LE(ivf_mem, off);
+    off += 4;
+    const probes = readU32LE(ivf_mem, off);
+    off += 4;
+    const index_n = readU32LE(ivf_mem, off);
+    off += 4;
+    _ = readU32LE(ivf_mem, off); // reserved
+    off += 4;
+
+    if (dim != D or index_n != n or clusters == 0) return error.BadIvfIndex;
+    if (probes == 0 or probes > MAX_NPROBE) return error.BadIvfIndex;
+
+    const c_usize: usize = @intCast(clusters);
+    const centroids_bytes = c_usize * D * @sizeOf(f32);
+    const boundaries_bytes = (c_usize + 1) * @sizeOf(u32);
+    if (ivf_mem.len != off + centroids_bytes + boundaries_bytes) return error.BadIvfIndex;
 
     n_vecs = n;
+    n_clusters = c_usize;
+    nprobe = @min(@as(usize, @intCast(probes)), c_usize);
     labels_data = lbl_mem.ptr;
     dims_data = @ptrCast(@alignCast(vec_mem.ptr));
+    centroids_data = @ptrCast(@alignCast(ivf_mem.ptr + off));
+    boundaries_data = @ptrCast(@alignCast(ivf_mem.ptr + off + centroids_bytes));
 }
 
-export fn vc_init(vec_path: [*:0]const u8, lbl_path: [*:0]const u8) c_int {
+export fn vc_init(vec_path: [*:0]const u8, lbl_path: [*:0]const u8, ivf_path: [*:0]const u8) c_int {
     const v = std.mem.sliceTo(vec_path, 0);
     const l = std.mem.sliceTo(lbl_path, 0);
-    initInternal(v, l) catch |err| {
+    const i = std.mem.sliceTo(ivf_path, 0);
+    initInternal(v, l, i) catch |err| {
         const msg = @errorName(err);
         std.debug.print("vc_init failed: {s}\n", .{msg});
         return -1;
@@ -77,6 +123,78 @@ export fn vc_init(vec_path: [*:0]const u8, lbl_path: [*:0]const u8) c_int {
 
 export fn vc_count() usize {
     return n_vecs;
+}
+
+inline fn insertTop(top_dist: *[K]f32, top_idx: *[K]u32, idx: u32, dist: f32) void {
+    if (dist < top_dist.*[K - 1]) {
+        var pos: usize = K - 1;
+        while (pos > 0 and top_dist.*[pos - 1] > dist) : (pos -= 1) {
+            top_dist.*[pos] = top_dist.*[pos - 1];
+            top_idx.*[pos] = top_idx.*[pos - 1];
+        }
+        top_dist.*[pos] = dist;
+        top_idx.*[pos] = idx;
+    }
+}
+
+inline fn insertProbe(top_dist: *[MAX_NPROBE]f32, top_idx: *[MAX_NPROBE]u32, limit: usize, idx: u32, dist: f32) void {
+    if (dist < top_dist.*[limit - 1]) {
+        var pos: usize = limit - 1;
+        while (pos > 0 and top_dist.*[pos - 1] > dist) : (pos -= 1) {
+            top_dist.*[pos] = top_dist.*[pos - 1];
+            top_idx.*[pos] = top_idx.*[pos - 1];
+        }
+        top_dist.*[pos] = dist;
+        top_idx.*[pos] = idx;
+    }
+}
+
+inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[K]f32, top_idx: *[K]u32) void {
+    const dims_ptr = dims_data;
+    const n = n_vecs;
+
+    var offset = start;
+    while (offset + VLEN <= end) : (offset += VLEN) {
+        var dist_lo: Vec32 = @splat(@as(f32, 0.0));
+        var dist_hi: Vec32 = @splat(@as(f32, 0.0));
+
+        comptime var d: usize = 0;
+        inline while (d < D) : (d += 1) {
+            const dim_base = dims_ptr + d * n;
+            const lo_ptr: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset);
+            const hi_ptr: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + AVX2_LANES);
+            const lo_vec16: Vec16 = lo_ptr.*;
+            const hi_vec16: Vec16 = hi_ptr.*;
+            const lo_vec: Vec32 = @floatCast(lo_vec16);
+            const hi_vec: Vec32 = @floatCast(hi_vec16);
+            const q: Vec32 = @splat(query.*[d]);
+            const diff_lo = q - lo_vec;
+            const diff_hi = q - hi_vec;
+            dist_lo = @mulAdd(Vec32, diff_lo, diff_lo, dist_lo);
+            dist_hi = @mulAdd(Vec32, diff_hi, diff_hi, dist_hi);
+        }
+
+        comptime var k: usize = 0;
+        inline while (k < AVX2_LANES) : (k += 1) {
+            insertTop(top_dist, top_idx, @intCast(offset + k), dist_lo[k]);
+        }
+
+        comptime var h: usize = 0;
+        inline while (h < AVX2_LANES) : (h += 1) {
+            insertTop(top_dist, top_idx, @intCast(offset + AVX2_LANES + h), dist_hi[h]);
+        }
+    }
+
+    while (offset < end) : (offset += 1) {
+        var dist: f32 = 0.0;
+        var d: usize = 0;
+        while (d < D) : (d += 1) {
+            const v: f32 = @floatCast(dims_ptr[d * n + offset]);
+            const diff = query.*[d] - v;
+            dist += diff * diff;
+        }
+        insertTop(top_dist, top_idx, @intCast(offset), dist);
+    }
 }
 
 export fn vc_query(query_ptr: [*]const f32) c_int {
@@ -91,62 +209,33 @@ export fn vc_query(query_ptr: [*]const f32) c_int {
     var top_dist = [_]f32{std.math.inf(f32)} ** K;
     var top_idx = [_]u32{0} ** K;
 
-    const dims_ptr = dims_data;
-    const n = n_vecs;
     const labels_ptr = labels_data;
+    const cluster_count = n_clusters;
+    const probe_count = nprobe;
+    const centroids_ptr = centroids_data;
+    const boundaries_ptr = boundaries_data;
 
-    const n_chunks = n / VLEN;
-    var chunk: usize = 0;
-    while (chunk < n_chunks) : (chunk += 1) {
-        const offset = chunk * VLEN;
-        var dist: Vec32 = @splat(@as(f32, 0.0));
+    var probe_dist = [_]f32{std.math.inf(f32)} ** MAX_NPROBE;
+    var probe_idx = [_]u32{0} ** MAX_NPROBE;
 
-        comptime var d: usize = 0;
-        inline while (d < D) : (d += 1) {
-            const dim_base = dims_ptr + d * n;
-            const slice_ptr: *const [VLEN]f16 = @ptrCast(dim_base + offset);
-            const dim_vec16: Vec16 = slice_ptr.*;
-            const dim_vec: Vec32 = @floatCast(dim_vec16);
-            const q: Vec32 = @splat(query[d]);
-            const diff = q - dim_vec;
-            dist = @mulAdd(Vec32, diff, diff, dist);
-        }
-
-        comptime var k: usize = 0;
-        inline while (k < VLEN) : (k += 1) {
-            const d_val = dist[k];
-            if (d_val < top_dist[K - 1]) {
-                const idx: u32 = @intCast(offset + k);
-                var pos: usize = K - 1;
-                while (pos > 0 and top_dist[pos - 1] > d_val) : (pos -= 1) {
-                    top_dist[pos] = top_dist[pos - 1];
-                    top_idx[pos] = top_idx[pos - 1];
-                }
-                top_dist[pos] = d_val;
-                top_idx[pos] = idx;
-            }
-        }
-    }
-
-    var i_rem: usize = n_chunks * VLEN;
-    while (i_rem < n) : (i_rem += 1) {
+    var c: usize = 0;
+    while (c < cluster_count) : (c += 1) {
+        const base = c * D;
         var dist: f32 = 0.0;
         var d: usize = 0;
         while (d < D) : (d += 1) {
-            const v: f32 = @floatCast(dims_ptr[d * n + i_rem]);
-            const diff = query[d] - v;
+            const diff = query[d] - centroids_ptr[base + d];
             dist += diff * diff;
         }
-        if (dist < top_dist[K - 1]) {
-            const idx: u32 = @intCast(i_rem);
-            var pos: usize = K - 1;
-            while (pos > 0 and top_dist[pos - 1] > dist) : (pos -= 1) {
-                top_dist[pos] = top_dist[pos - 1];
-                top_idx[pos] = top_idx[pos - 1];
-            }
-            top_dist[pos] = dist;
-            top_idx[pos] = idx;
-        }
+        insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c), dist);
+    }
+
+    var p: usize = 0;
+    while (p < probe_count) : (p += 1) {
+        const cluster_id: usize = @intCast(probe_idx[p]);
+        const start: usize = @intCast(boundaries_ptr[cluster_id]);
+        const end: usize = @intCast(boundaries_ptr[cluster_id + 1]);
+        scanRange(&query, start, end, &top_dist, &top_idx);
     }
 
     var fraud_count: c_int = 0;

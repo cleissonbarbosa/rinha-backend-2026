@@ -2,7 +2,9 @@ FROM nimlang/nim:2.2.4-alpine AS build
 
 WORKDIR /src
 
-RUN apk add --no-cache curl gzip ca-certificates xz tar
+RUN apk add --no-cache curl gzip ca-certificates git xz tar
+
+RUN nimble install -y httpbeast@0.4.2
 
 # Pin Zig to 0.13.0 so our @Vector / posix calls have a stable target.
 RUN curl -fsSL --retry 5 --retry-delay 2 \
@@ -32,7 +34,7 @@ RUN mkdir -p /data && \
         -o /tmp/references.json.gz \
         https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz && \
     gunzip -f /tmp/references.json.gz && \
-    /usr/local/bin/preprocess /tmp/references.json /data/vectors.bin /data/labels.bin && \
+    /usr/local/bin/preprocess /tmp/references.json /data/vectors.bin /data/labels.bin /data/ivf.bin && \
     rm -f /tmp/references.json
 
 # Compile the Zig vector core. -mcpu=haswell unlocks AVX2 + FMA + F16C, which
@@ -49,7 +51,7 @@ RUN nim c \
     -d:release \
     -d:danger \
     --mm:arc \
-    --threads:off \
+    --threads:on \
     --opt:speed \
     --passC:-flto \
     --passC:-march=haswell \
@@ -65,6 +67,7 @@ RUN adduser -D -H -u 10001 app
 COPY --from=build /out/rinha /app/rinha
 COPY --from=build /data/vectors.bin /data/vectors.bin
 COPY --from=build /data/labels.bin /data/labels.bin
+COPY --from=build /data/ivf.bin /data/ivf.bin
 
 RUN chown -R app:app /data
 
