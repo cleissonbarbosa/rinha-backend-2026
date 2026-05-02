@@ -4,7 +4,7 @@ build:
 	docker compose build --no-cache
 
 up:
-	docker compose up -d --build
+	docker compose --compatibility up -d --build
 
 down:
 	docker compose down --remove-orphans
@@ -22,7 +22,7 @@ logs:
 	docker compose logs -f --tail=100
 
 docker/clean:
-	docker compose down --remove-orphans
+	docker compose down --remove-orphans --rmi all --volumes
 	docker compose rm -f
 
 build/push:

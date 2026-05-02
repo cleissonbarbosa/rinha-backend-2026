@@ -4,7 +4,7 @@ const D = 14
 const ExpectedN = 3_000_000
 const DefaultIvfClusters = 4096
 const DefaultIvfNProbe = 128
-const MaxIvfNProbe = 128
+const MaxIvfNProbe = 16
 const DefaultIvfSample = 65_536
 const DefaultIvfIterations = 25
 
