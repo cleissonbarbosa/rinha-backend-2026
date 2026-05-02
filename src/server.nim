@@ -364,10 +364,14 @@ proc responseFor(fraudCount: int): string {.inline.} =
   let idx = max(0, min(fraudCount, K))
   ResponseTable[idx]
 
+const Q16Scale = 8192.0'f32
+
 proc scoreBody(body: string): string =
   try:
     var vec: array[D, float32]
     buildVector(body, vec)
+    for d in 0..<D:
+      vec[d] = round(vec[d] * Q16Scale)
     let count = vc_query(addr vec[0])
     responseFor(int(count))
   except CatchableError:

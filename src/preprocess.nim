@@ -3,8 +3,8 @@ import std/[os, math, memfiles, strutils]
 const D = 14
 const ExpectedN = 3_000_000
 const DefaultIvfClusters = 4096
-const DefaultIvfNProbe = 64
-const MaxIvfNProbe = 64
+const DefaultIvfNProbe = 128
+const MaxIvfNProbe = 128
 const DefaultIvfSample = 65_536
 const DefaultIvfIterations = 25
 
@@ -21,81 +21,15 @@ proc envInt(name: string; defaultValue: int): int =
   except ValueError:
     result = defaultValue
 
-proc f32ToF16(x: float32): uint16 =
-  let bits = cast[uint32](x)
-  let sign = uint16((bits shr 16) and 0x8000'u32)
-  let expField = int((bits shr 23) and 0xff'u32)
-  let mantissa = bits and 0x7fffff'u32
+const Q16Scale = 8192.0'f64
 
-  if expField == 0xff:
-    if mantissa == 0:
-      return sign or 0x7c00'u16
-    else:
-      return sign or 0x7e00'u16  
+proc f32ToQ16(x: float32): uint16 {.inline.} =
+  let scaled = round(float64(x) * Q16Scale)
+  let clamped = max(-32768.0, min(32767.0, scaled))
+  cast[uint16](int16(clamped))
 
-  if expField == 0:
-    return sign  
-
-  let unbiased = expField - 127
-
-  if unbiased > 15:
-    return sign or 0x7c00'u16  
-
-  if unbiased < -24:
-    return sign  
-
-  if unbiased < -14:
-    
-    let shift = -14 - unbiased
-    let m = (mantissa or 0x800000'u32) shr (uint32(13 + shift))
-    let half = 1'u32 shl uint32(12 + shift)
-    let kept = m
-    var rounded = kept
-    let lowMask = (1'u32 shl uint32(13 + shift)) - 1'u32
-    let dropped = (mantissa or 0x800000'u32) and lowMask
-    if dropped > half or (dropped == half and (kept and 1'u32) != 0'u32):
-      rounded += 1
-    return sign or uint16(rounded and 0x3ff'u32)
-
-  let exp16Field = uint32(unbiased + 15) shl 10
-  let mantTrunc = mantissa shr 13
-  let dropped = mantissa and 0x1fff'u32
-  let halfway = 0x1000'u32
-  var mantOut = mantTrunc
-  if dropped > halfway or (dropped == halfway and (mantTrunc and 1'u32) != 0'u32):
-    mantOut += 1
-  var expOut = exp16Field
-  if mantOut == 0x400'u32:
-    mantOut = 0
-    expOut += 0x400'u32
-  if (expOut shr 10) >= 0x1f'u32:
-    return sign or 0x7c00'u16  
-  return sign or uint16((expOut or mantOut) and 0x7fff'u32)
-
-proc f16ToF32(h: uint16): float32 {.inline.} =
-  let sign = uint32(h and 0x8000'u16) shl 16
-  let exp = int((h shr 10) and 0x1f'u16)
-  let mant = uint32(h and 0x03ff'u16)
-
-  var bits: uint32
-  if exp == 0:
-    if mant == 0'u32:
-      bits = sign
-    else:
-      var m = mant
-      var e = -14
-      while (m and 0x0400'u32) == 0'u32:
-        m = m shl 1
-        dec e
-      m = m and 0x03ff'u32
-      let exp32 = uint32(e + 127) shl 23
-      bits = sign or exp32 or (m shl 13)
-  elif exp == 0x1f:
-    bits = sign or 0x7f800000'u32 or (mant shl 13)
-  else:
-    let exp32 = uint32(exp - 15 + 127) shl 23
-    bits = sign or exp32 or (mant shl 13)
-  cast[float32](bits)
+proc q16ToF32(h: uint16): float32 {.inline.} =
+  float32(cast[int16](h))
 
 proc writeU32LE(f: File; value: uint32) =
   var bytes: array[4, uint8]
@@ -141,7 +75,7 @@ proc nearestCentroidVector(
   var point: array[D, float32]
   var d = 0
   while d < D:
-    point[d] = f16ToF32(vectors[d][idx])
+    point[d] = q16ToF32(vectors[d][idx])
     inc d
 
   var best = 0
@@ -181,7 +115,7 @@ proc trainIvf(
     let idx = int(seed mod uint64(n))
     var d = 0
     while d < D:
-      sample[s * D + d] = f16ToF32(vectors[d][idx])
+      sample[s * D + d] = q16ToF32(vectors[d][idx])
       inc d
     inc s
 
@@ -262,7 +196,7 @@ proc buildAssignments(
     let base = nearest * D
     var d = 0
     while d < D:
-      sums[base + d] += f16ToF32(vectors[d][i])
+      sums[base + d] += q16ToF32(vectors[d][i])
       inc d
     inc i
     if (i mod 250_000) == 0:
@@ -456,7 +390,7 @@ proc main() =
             continue
           let v = parseNumberFast(raw, total, p)
           if dimIdx < D:
-            currentVec[dimIdx] = f32ToF16(float32(v))
+            currentVec[dimIdx] = f32ToQ16(float32(v))
           inc dimIdx
         sawVector = true
       elif keyLen == 5 and raw[keyStart] == 'l':

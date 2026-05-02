@@ -6,11 +6,11 @@ const D: usize = 14;
 const K: usize = 5;
 const VLEN: usize = 16;
 const AVX2_LANES: usize = 8;
-const MAX_NPROBE: usize = 64;
+const MAX_NPROBE: usize = 128;
 const IVF_MAGIC = "RIVF2026";
 
 const Vec32 = @Vector(AVX2_LANES, f32);
-const Vec16 = @Vector(AVX2_LANES, f16);
+const Vec16 = @Vector(AVX2_LANES, i16);
 
 comptime {
     std.debug.assert(VLEN == AVX2_LANES * 2);
@@ -19,7 +19,7 @@ comptime {
 var n_vecs: usize = 0;
 var n_clusters: usize = 0;
 var nprobe: usize = 0;
-var dims_data: [*]align(64) const f16 = undefined;
+var dims_data: [*]align(64) const i16 = undefined;
 var labels_data: [*]const u8 = undefined;
 var centroids_data: [*]align(4) const f32 = undefined;
 var boundaries_data: [*]align(4) const u32 = undefined;
@@ -74,7 +74,7 @@ fn initInternal(vec_path: []const u8, lbl_path: []const u8, ivf_path: []const u8
     const ivf_mem = try mmapRO(ivf_path, 4);
 
     const n = lbl_mem.len;
-    if (vec_mem.len != D * n * @sizeOf(f16)) return error.SizeMismatch;
+    if (vec_mem.len != D * n * @sizeOf(i16)) return error.SizeMismatch;
     if ((@intFromPtr(vec_mem.ptr) % 16) != 0) return error.Misaligned;
     if (ivf_mem.len < IVF_MAGIC.len + 5 * @sizeOf(u32)) return error.BadIvfIndex;
     if (!std.mem.eql(u8, ivf_mem[0..IVF_MAGIC.len], IVF_MAGIC)) return error.BadIvfIndex;
@@ -165,19 +165,19 @@ inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[
             const dim_base = dims_ptr + d * n;
             const q: Vec32 = @splat(query.*[d]);
 
-            const p0: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset);
-            const p1: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + AVX2_LANES);
-            const p2: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + VLEN);
-            const p3: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + VLEN + AVX2_LANES);
+            const p0: *const [AVX2_LANES]i16 = @ptrCast(dim_base + offset);
+            const p1: *const [AVX2_LANES]i16 = @ptrCast(dim_base + offset + AVX2_LANES);
+            const p2: *const [AVX2_LANES]i16 = @ptrCast(dim_base + offset + VLEN);
+            const p3: *const [AVX2_LANES]i16 = @ptrCast(dim_base + offset + VLEN + AVX2_LANES);
 
             const v0_16: Vec16 = p0.*;
             const v1_16: Vec16 = p1.*;
             const v2_16: Vec16 = p2.*;
             const v3_16: Vec16 = p3.*;
-            const v0: Vec32 = @floatCast(v0_16);
-            const v1: Vec32 = @floatCast(v1_16);
-            const v2: Vec32 = @floatCast(v2_16);
-            const v3: Vec32 = @floatCast(v3_16);
+            const v0: Vec32 = @floatFromInt(v0_16);
+            const v1: Vec32 = @floatFromInt(v1_16);
+            const v2: Vec32 = @floatFromInt(v2_16);
+            const v3: Vec32 = @floatFromInt(v3_16);
             const d0 = q - v0;
             const d1 = q - v1;
             const d2 = q - v2;
@@ -215,12 +215,12 @@ inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[
         comptime var d: usize = 0;
         inline while (d < D) : (d += 1) {
             const dim_base = dims_ptr + d * n;
-            const lo_ptr: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset);
-            const hi_ptr: *const [AVX2_LANES]f16 = @ptrCast(dim_base + offset + AVX2_LANES);
+            const lo_ptr: *const [AVX2_LANES]i16 = @ptrCast(dim_base + offset);
+            const hi_ptr: *const [AVX2_LANES]i16 = @ptrCast(dim_base + offset + AVX2_LANES);
             const lo_vec16: Vec16 = lo_ptr.*;
             const hi_vec16: Vec16 = hi_ptr.*;
-            const lo_vec: Vec32 = @floatCast(lo_vec16);
-            const hi_vec: Vec32 = @floatCast(hi_vec16);
+            const lo_vec: Vec32 = @floatFromInt(lo_vec16);
+            const hi_vec: Vec32 = @floatFromInt(hi_vec16);
             const q: Vec32 = @splat(query.*[d]);
             const diff_lo = q - lo_vec;
             const diff_hi = q - hi_vec;
@@ -242,7 +242,7 @@ inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[
         var dist: f32 = 0.0;
         var d: usize = 0;
         while (d < D) : (d += 1) {
-            const v: f32 = @floatCast(dims_ptr[d * n + offset]);
+            const v: f32 = @floatFromInt(dims_ptr[d * n + offset]);
             const diff = query.*[d] - v;
             dist += diff * diff;
         }
