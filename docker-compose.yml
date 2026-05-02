@@ -19,6 +19,7 @@ services:
 
   api1:
     image: cleissonb/rinha-backend-2026-nim:latest
+    pull_policy: always
     container_name: rinha-api1
     environment:
       - API_PORT=8080
@@ -36,6 +37,7 @@ services:
 
   api2:
     image: cleissonb/rinha-backend-2026-nim:latest
+    pull_policy: always
     container_name: rinha-api2
     environment:
       - API_PORT=8080
