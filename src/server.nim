@@ -1,6 +1,7 @@
-import std/[asynchttpserver, asyncdispatch, math, os, strutils]
+import std/[asyncdispatch, math, options, os, strutils]
+import httpbeast
 
-## Reference dataset constants -- mirror normalization.json.
+
 const
   MaxAmount = 10_000.0'f32
   MaxInstallments = 12.0'f32
@@ -12,12 +13,12 @@ const
   D = 14
   K = 5
 
-## Zig FFI surface.
-proc vc_init(vecPath: cstring; lblPath: cstring): cint {.importc.}
-proc vc_count(): csize_t {.importc.}
-proc vc_query(query: ptr float32): cint {.importc.}
 
-## Hand-rolled JSON helpers.
+proc vc_init(vecPath: cstring; lblPath: cstring; ivfPath: cstring): cint {.importc, gcsafe.}
+proc vc_count(): csize_t {.importc, gcsafe.}
+proc vc_query(query: ptr float32): cint {.importc, gcsafe.}
+
+
 template isDigit(c: char): bool = c >= '0' and c <= '9'
 
 proc skipWs(s: string; p: var int) {.inline.} =
@@ -29,7 +30,7 @@ proc skipWs(s: string; p: var int) {.inline.} =
       return
 
 proc valuePos(s: string; key: string; lo, hi: int): int =
-  ## Returns the offset of the value byte after `"key":` whitespace, scanning [lo, hi).
+  
   let keyPos = s.find(key, lo, hi - 1)
   if keyPos < 0:
     return -1
@@ -125,7 +126,7 @@ proc parseDigitsAt(s: string; p0, p1: int): int =
     v = v * 10 + (ord(s[i]) - ord('0'))
   v
 
-## Day-of-week (Mon=0..Sun=6) via Zeller's congruence.
+
 proc dayOfWeek(year, month, day: int): int =
   var y = year
   var m = month
@@ -135,10 +136,10 @@ proc dayOfWeek(year, month, day: int): int =
   let kk = y mod 100
   let jj = y div 100
   let h = (day + (13 * (m + 1)) div 5 + kk + kk div 4 + jj div 4 + 5 * jj) mod 7
-  ## h: 0=Sat 1=Sun 2=Mon 3=Tue 4=Wed 5=Thu 6=Fri  ->  Mon=0..Sun=6
+  
   (h + 5) mod 7
 
-## Howard Hinnant's days_from_civil; returns days since 1970-01-01.
+
 proc daysFromCivil(y, m, d: int): int64 =
   var year = y
   if m <= 2: year -= 1
@@ -149,7 +150,7 @@ proc daysFromCivil(y, m, d: int): int64 =
   let doe = yoe * 365 + yoe div 4 - yoe div 100 + doy
   era.int64 * 146097'i64 + doe.int64 - 719468'i64
 
-## Parses "YYYY-MM-DDTHH:MM:SSZ" -> total minutes since 1970-01-01.
+
 proc parseTimestamp(s: string; lo: int): tuple[hour, dow: int, totalMinutes: int64] =
   let year = parseDigitsAt(s, lo, lo + 4)
   let month = parseDigitsAt(s, lo + 5, lo + 7)
@@ -181,7 +182,7 @@ proc clamp01(x: float32): float32 {.inline.} =
   else: x
 
 proc containsExact(s: string; lo, hi: int; needleLo, needleHi: int): bool =
-  ## Looks up an exact quoted token "needle" inside [lo, hi).
+  
   let needleLen = needleHi - needleLo
   var p = lo
   while p < hi:
@@ -206,7 +207,7 @@ proc containsExact(s: string; lo, hi: int; needleLo, needleHi: int): bool =
   false
 
 proc skipObject(s: string; p0: int): int =
-  ## Returns the index just past the matching '}' for the object that starts at p0.
+  
   var p = p0
   if p >= s.len or s[p] != '{':
     return p
@@ -280,7 +281,7 @@ proc buildVector(body: string; vec: var array[D, float32]) =
   let custAvg = parseFloat(body, "\"avg_amount\"", customerPos, customerEnd)
   let txCount24h = parseInt(body, "\"tx_count_24h\"", customerPos, customerEnd)
 
-  ## known_merchants is an array; locate its bounds.
+  
   let knownStart = valuePos(body, "\"known_merchants\"", customerPos, customerEnd)
   if knownStart < 0 or body[knownStart] != '[':
     raise newException(ValueError, "missing known_merchants")
@@ -299,10 +300,10 @@ proc buildVector(body: string; vec: var array[D, float32]) =
   let cardPresent = parseBool(body, "\"card_present\"", terminalPos, terminalEnd)
   let kmFromHome = parseFloat(body, "\"km_from_home\"", terminalPos, terminalEnd)
 
-  ## Reference time data.
+  
   let (txHour, txDow, txMinutes) = parseTimestamp(body, reqAtLo)
 
-  ## Optional last_transaction.
+  
   var hasLast = false
   var lastMinutes: int64 = 0
   var lastKm: float64 = 0.0
@@ -319,7 +320,7 @@ proc buildVector(body: string; vec: var array[D, float32]) =
 
   let merchantKnown = containsExact(body, knownStart, knownEnd, midLo, midHi)
 
-  ## Build the 14-dim vector.
+  
   vec[0] = clamp01(float32(amount) / MaxAmount)
   vec[1] = clamp01(float32(installments) / MaxInstallments)
 
@@ -370,43 +371,46 @@ proc scoreBody(body: string): string =
     let count = vc_query(addr vec[0])
     responseFor(int(count))
   except CatchableError:
-    ## Fallback: deny -- a false positive (weight 1) is cheaper than an HTTP error (weight 5).
+    
     FallbackBody
 
-## Headers are reused across every request. asynchttpserver only reads from them
-## when serializing the response, and the server runs single-threaded, so the
-## shared refs are safe.
-let
-  TextHeaders = newHttpHeaders([
-    ("Content-Type", "text/plain"),
-    ("Cache-Control", "no-store"),
-  ])
-  JsonHeaders = newHttpHeaders([
-    ("Content-Type", "application/json"),
-    ("Cache-Control", "no-store"),
-  ])
+const
+  TextHeaders = "Content-Type: text/plain\c\LCache-Control: no-store"
+  JsonHeaders = "Content-Type: application/json\c\LCache-Control: no-store"
 
-proc handle(req: Request) {.async, gcsafe.} =
-  let path = req.url.path
-  if req.reqMethod == HttpPost and path == "/fraud-score":
-    await req.respond(Http200, scoreBody(req.body), JsonHeaders)
-  elif req.reqMethod == HttpGet and path == "/ready":
-    await req.respond(Http200, "ok", TextHeaders)
-  else:
-    await req.respond(Http404, "not found", TextHeaders)
+proc handle(req: Request): Future[void] {.gcsafe.} =
+  let reqMethod = req.httpMethod()
+  let path = req.path()
+  if reqMethod.isSome and path.isSome:
+    if reqMethod.get() == HttpPost and path.get() == "/fraud-score":
+      let body = req.body()
+      if body.isSome:
+        req.send(Http200, scoreBody(body.get()), JsonHeaders)
+      else:
+        req.send(Http400, "bad request", TextHeaders)
+      return nil
+    if reqMethod.get() == HttpGet and path.get() == "/ready":
+      req.send(Http200, "ok", TextHeaders)
+      return nil
+
+  req.send(Http404, "not found", TextHeaders)
+  nil
 
 when isMainModule:
   let portNumber = parseInt(getEnv("API_PORT", "8080"))
   let vecPath = getEnv("VECTORS_PATH", "/data/vectors.bin")
   let lblPath = getEnv("LABELS_PATH", "/data/labels.bin")
+  let ivfPath = getEnv("IVF_PATH", "/data/ivf.bin")
+  let workerCount = parseInt(getEnv("HTTP_THREADS", "2"))
 
-  let rc = vc_init(vecPath.cstring, lblPath.cstring)
+  let rc = vc_init(vecPath.cstring, lblPath.cstring, ivfPath.cstring)
   if rc != 0:
     quit("vc_init failed (rc=" & $rc & ")", 1)
 
   echo "loaded ", vc_count(), " reference vectors"
 
-  let server = newAsyncHttpServer()
-  let callback = proc(req: Request): Future[void] {.closure, gcsafe.} =
-    handle(req)
-  waitFor server.serve(Port(portNumber), callback, address = "0.0.0.0")
+  run(handle, initSettings(
+    port = Port(portNumber),
+    bindAddr = "0.0.0.0",
+    numThreads = workerCount
+  ))
