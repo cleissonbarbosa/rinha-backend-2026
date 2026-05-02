@@ -3,7 +3,7 @@ import std/[os, math, memfiles, strutils]
 const D = 14
 const ExpectedN = 3_000_000
 const DefaultIvfClusters = 4096
-const DefaultIvfNProbe = 16
+const DefaultIvfNProbe = 64
 const MaxIvfNProbe = 64
 const DefaultIvfSample = 65_536
 const DefaultIvfIterations = 25
