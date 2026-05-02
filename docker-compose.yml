@@ -15,7 +15,7 @@ services:
       resources:
         limits:
           cpus: "0.10"
-          memory: "32MB"
+          memory: "20MB"
 
   api1:
     build: .
@@ -23,13 +23,15 @@ services:
     container_name: rinha-api1
     environment:
       - API_PORT=8080
+      - VECTORS_PATH=/data/vectors.bin
+      - LABELS_PATH=/data/labels.bin
     networks:
       - rinha
     deploy:
       resources:
         limits:
           cpus: "0.45"
-          memory: "128MB"
+          memory: "165MB"
 
   api2:
     build: .
@@ -37,15 +39,16 @@ services:
     container_name: rinha-api2
     environment:
       - API_PORT=8080
+      - VECTORS_PATH=/data/vectors.bin
+      - LABELS_PATH=/data/labels.bin
     networks:
       - rinha
     deploy:
       resources:
         limits:
           cpus: "0.45"
-          memory: "128MB"
+          memory: "165MB"
 
 networks:
   rinha:
     driver: bridge
-
