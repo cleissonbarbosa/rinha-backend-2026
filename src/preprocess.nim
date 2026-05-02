@@ -223,16 +223,46 @@ proc buildAssignments(
 
   (assignments, boundaries)
 
+proc buildClusterRadii(
+  vectors: var array[D, seq[uint16]];
+  assignments: seq[uint16];
+  centroids: seq[float32];
+  clusterCount: int
+): seq[float32] =
+  echo "measuring IVF cluster radii"
+  var radiiSq = newSeq[float32](clusterCount)
+
+  var i = 0
+  while i < assignments.len:
+    let cluster = int(assignments[i])
+    let base = cluster * D
+    var dist = 0.0'f32
+    var d = 0
+    while d < D:
+      let diff = q16ToF32(vectors[d][i]) - centroids[base + d]
+      dist += diff * diff
+      inc d
+    if dist > radiiSq[cluster]:
+      radiiSq[cluster] = dist
+    inc i
+    if (i mod 500_000) == 0:
+      echo "  measured ", i, " vectors"
+
+  result = newSeq[float32](clusterCount)
+  for cluster in 0..<clusterCount:
+    result[cluster] = sqrt(radiiSq[cluster])
+
 proc writeIvfIndex(
   outPath: string;
   centroids: seq[float32];
+  radii: seq[float32];
   boundaries: seq[uint32];
   clusterCount: int;
   nprobe: int;
   n: int
 ) =
   echo "writing ", outPath,
-       " (", centroids.len * 4 + boundaries.len * 4 + 28, " bytes)"
+       " (", centroids.len * 4 + radii.len * 4 + boundaries.len * 4 + 28, " bytes)"
   var outIdx = system.open(outPath, fmWrite)
   outIdx.write(IvfMagic)
   writeU32LE(outIdx, uint32(D))
@@ -244,6 +274,10 @@ proc writeIvfIndex(
   var i = 0
   while i < centroids.len:
     writeF32LE(outIdx, centroids[i])
+    inc i
+  i = 0
+  while i < radii.len:
+    writeF32LE(outIdx, radii[i])
     inc i
   i = 0
   while i < boundaries.len:
@@ -459,6 +493,7 @@ proc main() =
 
   var centroids = trainIvf(vectors, n, clusterCount, sampleCount, iterations)
   let (assignments, boundaries) = buildAssignments(vectors, n, centroids, clusterCount)
+  let radii = buildClusterRadii(vectors, assignments, centroids, clusterCount)
 
   echo "writing ", outVecPath, " (", n * D * 2, " bytes)"
   var outVec = system.open(outVecPath, fmWrite)
@@ -496,7 +531,7 @@ proc main() =
     quit("short write on labels.bin", 1)
   outLbl.close()
 
-  writeIvfIndex(outIvfPath, centroids, boundaries, clusterCount, nprobe, n)
+  writeIvfIndex(outIvfPath, centroids, radii, boundaries, clusterCount, nprobe, n)
 
   mf.close()
   echo "done"

@@ -1,7 +1,7 @@
 .PHONY: build up down smoke test logs
 
 build:
-	docker compose build
+	docker compose build --no-cache
 
 up:
 	docker compose up -d --build
@@ -20,3 +20,10 @@ official-smoke:
 
 logs:
 	docker compose logs -f --tail=100
+
+docker/clean:
+	docker compose down --remove-orphans
+	docker compose rm -f
+
+build/push:
+	docker compose push

@@ -7,6 +7,7 @@ const K: usize = 5;
 const VLEN: usize = 16;
 const AVX2_LANES: usize = 8;
 const MAX_NPROBE: usize = 128;
+const MAX_CLUSTERS: usize = 8192;
 const IVF_MAGIC = "RIVF2026";
 
 const Vec32 = @Vector(AVX2_LANES, f32);
@@ -22,6 +23,7 @@ var nprobe: usize = 0;
 var dims_data: [*]align(64) const i16 = undefined;
 var labels_data: [*]const u8 = undefined;
 var centroids_data: [*]align(4) const f32 = undefined;
+var radii_data: [*]align(4) const f32 = undefined;
 var boundaries_data: [*]align(4) const u32 = undefined;
 
 inline fn readU32LE(mem: []align(std.mem.page_size) const u8, offset: usize) u32 {
@@ -91,13 +93,14 @@ fn initInternal(vec_path: []const u8, lbl_path: []const u8, ivf_path: []const u8
     _ = readU32LE(ivf_mem, off); // reserved
     off += 4;
 
-    if (dim != D or index_n != n or clusters == 0) return error.BadIvfIndex;
+    if (dim != D or index_n != n or clusters == 0 or clusters > MAX_CLUSTERS) return error.BadIvfIndex;
     if (probes == 0 or probes > MAX_NPROBE) return error.BadIvfIndex;
 
     const c_usize: usize = @intCast(clusters);
     const centroids_bytes = c_usize * D * @sizeOf(f32);
+    const radii_bytes = c_usize * @sizeOf(f32);
     const boundaries_bytes = (c_usize + 1) * @sizeOf(u32);
-    if (ivf_mem.len != off + centroids_bytes + boundaries_bytes) return error.BadIvfIndex;
+    if (ivf_mem.len != off + centroids_bytes + radii_bytes + boundaries_bytes) return error.BadIvfIndex;
 
     n_vecs = n;
     n_clusters = c_usize;
@@ -105,7 +108,8 @@ fn initInternal(vec_path: []const u8, lbl_path: []const u8, ivf_path: []const u8
     labels_data = lbl_mem.ptr;
     dims_data = @ptrCast(@alignCast(vec_mem.ptr));
     centroids_data = @ptrCast(@alignCast(ivf_mem.ptr + off));
-    boundaries_data = @ptrCast(@alignCast(ivf_mem.ptr + off + centroids_bytes));
+    radii_data = @ptrCast(@alignCast(ivf_mem.ptr + off + centroids_bytes));
+    boundaries_data = @ptrCast(@alignCast(ivf_mem.ptr + off + centroids_bytes + radii_bytes));
 }
 
 export fn vc_init(vec_path: [*:0]const u8, lbl_path: [*:0]const u8, ivf_path: [*:0]const u8) c_int {
@@ -146,6 +150,13 @@ inline fn insertProbe(top_dist: *[MAX_NPROBE]f32, top_idx: *[MAX_NPROBE]u32, lim
         top_dist.*[pos] = dist;
         top_idx.*[pos] = idx;
     }
+}
+
+inline fn lowerBoundSq(centroid_sq_dist: f32, radius: f32) f32 {
+    const centroid_dist = @sqrt(centroid_sq_dist);
+    if (centroid_dist <= radius) return 0.0;
+    const delta = centroid_dist - radius;
+    return delta * delta;
 }
 
 inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[K]f32, top_idx: *[K]u32) void {
@@ -266,10 +277,13 @@ export fn vc_query(query_ptr: [*]const f32) c_int {
     const cluster_count = n_clusters;
     const probe_count = nprobe;
     const centroids_ptr = centroids_data;
+    const radii_ptr = radii_data;
     const boundaries_ptr = boundaries_data;
 
     var probe_dist = [_]f32{std.math.inf(f32)} ** MAX_NPROBE;
     var probe_idx = [_]u32{0} ** MAX_NPROBE;
+    var centroid_dist = [_]f32{0.0} ** MAX_CLUSTERS;
+    var probed = [_]bool{false} ** MAX_CLUSTERS;
 
     // Centroid search: process 4 clusters at a time for better ILP
     const cluster_count_aligned = cluster_count & ~@as(usize, 3);
@@ -295,6 +309,10 @@ export fn vc_query(query_ptr: [*]const f32) c_int {
             d2 += diff2 * diff2;
             d3 += diff3 * diff3;
         }
+        centroid_dist[c] = d0;
+        centroid_dist[c + 1] = d1;
+        centroid_dist[c + 2] = d2;
+        centroid_dist[c + 3] = d3;
         insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c), d0);
         insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c + 1), d1);
         insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c + 2), d2);
@@ -308,15 +326,33 @@ export fn vc_query(query_ptr: [*]const f32) c_int {
             const diff = query[d] - centroids_ptr[base + d];
             dist += diff * diff;
         }
+        centroid_dist[c] = dist;
         insertProbe(&probe_dist, &probe_idx, probe_count, @intCast(c), dist);
     }
 
     var p: usize = 0;
     while (p < probe_count) : (p += 1) {
         const cluster_id: usize = @intCast(probe_idx[p]);
+        probed[cluster_id] = true;
         const start: usize = @intCast(boundaries_ptr[cluster_id]);
         const end: usize = @intCast(boundaries_ptr[cluster_id + 1]);
         scanRange(&query, start, end, &top_dist, &top_idx);
+    }
+
+    var expanded = true;
+    while (expanded) {
+        expanded = false;
+        const tau = top_dist[K - 1];
+        c = 0;
+        while (c < cluster_count) : (c += 1) {
+            if (probed[c]) continue;
+            if (lowerBoundSq(centroid_dist[c], radii_ptr[c]) >= tau) continue;
+            probed[c] = true;
+            const start: usize = @intCast(boundaries_ptr[c]);
+            const end: usize = @intCast(boundaries_ptr[c + 1]);
+            scanRange(&query, start, end, &top_dist, &top_idx);
+            expanded = true;
+        }
     }
 
     var fraud_count: c_int = 0;
