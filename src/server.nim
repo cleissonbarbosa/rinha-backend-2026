@@ -14,7 +14,7 @@ const
   K = 5
 
 
-proc vc_init(vecPath: cstring; lblPath: cstring; ivfPath: cstring): cint {.importc, gcsafe.}
+proc vc_init(vecPath: cstring; lblPath: cstring; resPath: cstring; ivfPath: cstring): cint {.importc, gcsafe.}
 proc vc_count(): csize_t {.importc, gcsafe.}
 proc vc_query(query: ptr float32): cint {.importc, gcsafe.}
 
@@ -364,14 +364,10 @@ proc responseFor(fraudCount: int): string {.inline.} =
   let idx = max(0, min(fraudCount, K))
   ResponseTable[idx]
 
-const Q16Scale = 8192.0'f32
-
 proc scoreBody(body: string): string =
   try:
     var vec: array[D, float32]
     buildVector(body, vec)
-    for d in 0..<D:
-      vec[d] = round(vec[d] * Q16Scale)
     let count = vc_query(addr vec[0])
     responseFor(int(count))
   except CatchableError:
@@ -404,10 +400,11 @@ when isMainModule:
   let portNumber = parseInt(getEnv("API_PORT", "8080"))
   let vecPath = getEnv("VECTORS_PATH", "/data/vectors.bin")
   let lblPath = getEnv("LABELS_PATH", "/data/labels.bin")
+  let resPath = getEnv("RESIDUALS_PATH", "/data/residuals.bin")
   let ivfPath = getEnv("IVF_PATH", "/data/ivf.bin")
   let workerCount = parseInt(getEnv("HTTP_THREADS", "2"))
 
-  let rc = vc_init(vecPath.cstring, lblPath.cstring, ivfPath.cstring)
+  let rc = vc_init(vecPath.cstring, lblPath.cstring, resPath.cstring, ivfPath.cstring)
   if rc != 0:
     quit("vc_init failed (rc=" & $rc & ")", 1)
 

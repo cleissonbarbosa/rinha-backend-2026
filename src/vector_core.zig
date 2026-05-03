@@ -4,11 +4,18 @@ const posix = std.posix;
 
 const D: usize = 14;
 const K: usize = 5;
+const TOP_C: usize = 8;
 const VLEN: usize = 16;
 const AVX2_LANES: usize = 8;
 const MAX_NPROBE: usize = 24;
 const MAX_CLUSTERS: usize = 4096;
 const IVF_MAGIC = "RIVF2026";
+const Q16_SCALE: f32 = 32767.0;
+const REFINE_STEP: i32 = 128;
+const REFINE_SCALE: f32 = Q16_SCALE * @as(f32, @floatFromInt(REFINE_STEP));
+const REFINE_MIN: i32 = -32767 * REFINE_STEP;
+const REFINE_MAX: i32 = 32767 * REFINE_STEP;
+const COARSE_TIE_GAP: f32 = 512.0;
 
 const Vec32 = @Vector(AVX2_LANES, f32);
 const Vec16 = @Vector(AVX2_LANES, i16);
@@ -21,6 +28,7 @@ var n_vecs: usize = 0;
 var n_clusters: usize = 0;
 var nprobe: usize = 0;
 var dims_data: [*]align(64) const i16 = undefined;
+var residuals_data: [*]const u8 = undefined;
 var labels_data: [*]const u8 = undefined;
 var centroids_data: [*]align(4) const f32 = undefined;
 var radii_data: [*]align(4) const f32 = undefined;
@@ -70,13 +78,15 @@ fn mmapRO(path: []const u8, expected_align: usize) ![]align(std.mem.page_size) c
     return mem[0..size];
 }
 
-fn initInternal(vec_path: []const u8, lbl_path: []const u8, ivf_path: []const u8) !void {
+fn initInternal(vec_path: []const u8, lbl_path: []const u8, res_path: []const u8, ivf_path: []const u8) !void {
     const lbl_mem = try mmapRO(lbl_path, 1);
     const vec_mem = try mmapRO(vec_path, 64);
+    const res_mem = try mmapRO(res_path, 1);
     const ivf_mem = try mmapRO(ivf_path, 4);
 
     const n = lbl_mem.len;
     if (vec_mem.len != D * n * @sizeOf(i16)) return error.SizeMismatch;
+    if (res_mem.len != D * n) return error.SizeMismatch;
     if ((@intFromPtr(vec_mem.ptr) % 16) != 0) return error.Misaligned;
     if (ivf_mem.len < IVF_MAGIC.len + 5 * @sizeOf(u32)) return error.BadIvfIndex;
     if (!std.mem.eql(u8, ivf_mem[0..IVF_MAGIC.len], IVF_MAGIC)) return error.BadIvfIndex;
@@ -107,16 +117,18 @@ fn initInternal(vec_path: []const u8, lbl_path: []const u8, ivf_path: []const u8
     nprobe = @min(@as(usize, @intCast(probes)), c_usize);
     labels_data = lbl_mem.ptr;
     dims_data = @ptrCast(@alignCast(vec_mem.ptr));
+    residuals_data = res_mem.ptr;
     centroids_data = @ptrCast(@alignCast(ivf_mem.ptr + off));
     radii_data = @ptrCast(@alignCast(ivf_mem.ptr + off + centroids_bytes));
     boundaries_data = @ptrCast(@alignCast(ivf_mem.ptr + off + centroids_bytes + radii_bytes));
 }
 
-export fn vc_init(vec_path: [*:0]const u8, lbl_path: [*:0]const u8, ivf_path: [*:0]const u8) c_int {
+export fn vc_init(vec_path: [*:0]const u8, lbl_path: [*:0]const u8, res_path: [*:0]const u8, ivf_path: [*:0]const u8) c_int {
     const v = std.mem.sliceTo(vec_path, 0);
     const l = std.mem.sliceTo(lbl_path, 0);
+    const r = std.mem.sliceTo(res_path, 0);
     const i = std.mem.sliceTo(ivf_path, 0);
-    initInternal(v, l, i) catch |err| {
+    initInternal(v, l, r, i) catch |err| {
         const msg = @errorName(err);
         std.debug.print("vc_init failed: {s}\n", .{msg});
         return -1;
@@ -128,7 +140,19 @@ export fn vc_count() usize {
     return n_vecs;
 }
 
-inline fn insertTop(top_dist: *[K]f32, top_idx: *[K]u32, idx: u32, dist: f32) void {
+inline fn insertCandidate(top_dist: *[TOP_C]f32, top_idx: *[TOP_C]u32, idx: u32, dist: f32) void {
+    if (dist < top_dist.*[TOP_C - 1]) {
+        var pos: usize = TOP_C - 1;
+        while (pos > 0 and top_dist.*[pos - 1] > dist) : (pos -= 1) {
+            top_dist.*[pos] = top_dist.*[pos - 1];
+            top_idx.*[pos] = top_idx.*[pos - 1];
+        }
+        top_dist.*[pos] = dist;
+        top_idx.*[pos] = idx;
+    }
+}
+
+inline fn insertRefined(top_dist: *[K]i64, top_idx: *[K]u32, idx: u32, dist: i64) void {
     if (dist < top_dist.*[K - 1]) {
         var pos: usize = K - 1;
         while (pos > 0 and top_dist.*[pos - 1] > dist) : (pos -= 1) {
@@ -159,7 +183,7 @@ inline fn lowerBoundSq(centroid_sq_dist: f32, radius: f32) f32 {
     return delta * delta;
 }
 
-inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[K]f32, top_idx: *[K]u32) void {
+inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[TOP_C]f32, top_idx: *[TOP_C]u32) void {
     const dims_ptr = dims_data;
     const n = n_vecs;
     const STRIDE = VLEN * 2; // Process 32 vectors per iteration
@@ -202,19 +226,19 @@ inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[
 
         comptime var k: usize = 0;
         inline while (k < AVX2_LANES) : (k += 1) {
-            insertTop(top_dist, top_idx, @intCast(offset + k), dist_0[k]);
+            insertCandidate(top_dist, top_idx, @intCast(offset + k), dist_0[k]);
         }
         comptime var k1: usize = 0;
         inline while (k1 < AVX2_LANES) : (k1 += 1) {
-            insertTop(top_dist, top_idx, @intCast(offset + AVX2_LANES + k1), dist_1[k1]);
+            insertCandidate(top_dist, top_idx, @intCast(offset + AVX2_LANES + k1), dist_1[k1]);
         }
         comptime var k2: usize = 0;
         inline while (k2 < AVX2_LANES) : (k2 += 1) {
-            insertTop(top_dist, top_idx, @intCast(offset + VLEN + k2), dist_2[k2]);
+            insertCandidate(top_dist, top_idx, @intCast(offset + VLEN + k2), dist_2[k2]);
         }
         comptime var k3: usize = 0;
         inline while (k3 < AVX2_LANES) : (k3 += 1) {
-            insertTop(top_dist, top_idx, @intCast(offset + VLEN + AVX2_LANES + k3), dist_3[k3]);
+            insertCandidate(top_dist, top_idx, @intCast(offset + VLEN + AVX2_LANES + k3), dist_3[k3]);
         }
     }
 
@@ -241,11 +265,11 @@ inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[
 
         comptime var k: usize = 0;
         inline while (k < AVX2_LANES) : (k += 1) {
-            insertTop(top_dist, top_idx, @intCast(offset + k), dist_lo[k]);
+            insertCandidate(top_dist, top_idx, @intCast(offset + k), dist_lo[k]);
         }
         comptime var h: usize = 0;
         inline while (h < AVX2_LANES) : (h += 1) {
-            insertTop(top_dist, top_idx, @intCast(offset + AVX2_LANES + h), dist_hi[h]);
+            insertCandidate(top_dist, top_idx, @intCast(offset + AVX2_LANES + h), dist_hi[h]);
         }
     }
 
@@ -257,21 +281,47 @@ inline fn scanRange(query: *const [D]f32, start: usize, end: usize, top_dist: *[
             const diff = query.*[d] - v;
             dist += diff * diff;
         }
-        insertTop(top_dist, top_idx, @intCast(offset), dist);
+        insertCandidate(top_dist, top_idx, @intCast(offset), dist);
     }
+}
+
+inline fn quant16(x: f32) i32 {
+    var scaled = @round(x * Q16_SCALE);
+    if (scaled < -32767.0) scaled = -32767.0;
+    if (scaled > 32767.0) scaled = 32767.0;
+    return @intFromFloat(scaled);
+}
+
+inline fn quantRefined(x: f32) i32 {
+    var scaled = @round(x * REFINE_SCALE);
+    if (scaled < @as(f32, @floatFromInt(REFINE_MIN))) scaled = @as(f32, @floatFromInt(REFINE_MIN));
+    if (scaled > @as(f32, @floatFromInt(REFINE_MAX))) scaled = @as(f32, @floatFromInt(REFINE_MAX));
+    return @intFromFloat(scaled);
+}
+
+inline fn refRefined(idx: usize, dim: usize) i32 {
+    const base = dim * n_vecs + idx;
+    const hi: i32 = @intCast(dims_data[base]);
+    const residual: i32 = @intCast(@as(i8, @bitCast(residuals_data[base])));
+    return hi * REFINE_STEP + residual;
 }
 
 export fn vc_query(query_ptr: [*]const f32) c_int {
     if (n_vecs == 0) return 0;
 
     var query: [D]f32 = undefined;
+    var queryRefined: [D]i32 = undefined;
     {
         var i: usize = 0;
-        while (i < D) : (i += 1) query[i] = query_ptr[i];
+        while (i < D) : (i += 1) {
+            const q16 = quant16(query_ptr[i]);
+            queryRefined[i] = quantRefined(query_ptr[i]);
+            query[i] = @floatFromInt(q16);
+        }
     }
 
-    var top_dist = [_]f32{std.math.inf(f32)} ** K;
-    var top_idx = [_]u32{0} ** K;
+    var top_dist = [_]f32{std.math.inf(f32)} ** TOP_C;
+    var top_idx = [_]u32{0} ** TOP_C;
 
     const labels_ptr = labels_data;
     const cluster_count = n_clusters;
@@ -342,7 +392,7 @@ export fn vc_query(query_ptr: [*]const f32) c_int {
     var expanded = true;
     while (expanded) {
         expanded = false;
-        const tau = top_dist[K - 1];
+        const tau = top_dist[TOP_C - 1];
         c = 0;
         while (c < cluster_count) : (c += 1) {
             if (probed[c]) continue;
@@ -355,10 +405,33 @@ export fn vc_query(query_ptr: [*]const f32) c_int {
         }
     }
 
+    if (TOP_C > K and top_dist[K] - top_dist[K - 1] <= COARSE_TIE_GAP) {
+        var fraud_count: c_int = 0;
+        var k: usize = 0;
+        while (k < K) : (k += 1) {
+            if (labels_ptr[top_idx[k]] != 0) fraud_count += 1;
+        }
+        return fraud_count;
+    }
+
+    var refined_dist = [_]i64{std.math.maxInt(i64)} ** K;
+    var refined_idx = [_]u32{0} ** K;
+    var candidate: usize = 0;
+    while (candidate < TOP_C and top_dist[candidate] != std.math.inf(f32)) : (candidate += 1) {
+        const idx: usize = @intCast(top_idx[candidate]);
+        var dist: i64 = 0;
+        var d: usize = 0;
+        while (d < D) : (d += 1) {
+            const diff = @as(i64, queryRefined[d]) - @as(i64, refRefined(idx, d));
+            dist += diff * diff;
+        }
+        insertRefined(&refined_dist, &refined_idx, top_idx[candidate], dist);
+    }
+
     var fraud_count: c_int = 0;
     var k: usize = 0;
     while (k < K) : (k += 1) {
-        if (labels_ptr[top_idx[k]] != 0) fraud_count += 1;
+        if (labels_ptr[refined_idx[k]] != 0) fraud_count += 1;
     }
     return fraud_count;
 }
