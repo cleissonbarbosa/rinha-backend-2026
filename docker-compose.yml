@@ -27,6 +27,7 @@ services:
       - API_PORT=8080
       - VECTORS_PATH=/data/vectors.bin
       - LABELS_PATH=/data/labels.bin
+      - RESIDUALS_PATH=/data/residuals.bin
       - IVF_PATH=/data/ivf.bin
       - HTTP_THREADS=2
     networks:
@@ -46,6 +47,7 @@ services:
       - API_PORT=8080
       - VECTORS_PATH=/data/vectors.bin
       - LABELS_PATH=/data/labels.bin
+      - RESIDUALS_PATH=/data/residuals.bin
       - IVF_PATH=/data/ivf.bin
       - HTTP_THREADS=2
     networks:

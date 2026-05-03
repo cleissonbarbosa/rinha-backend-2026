@@ -27,14 +27,14 @@ RUN nim c \
     src/preprocess.nim
 
 # Fetch the official reference dataset and convert it to a compact binary
-# layout (SoA float16 vectors + u8 labels). The raw .json.gz never makes it
+# layout (SoA int16 vectors + u8 residuals/labels). The raw .json.gz never makes it
 # into the runtime image.
 RUN mkdir -p /data && \
     curl -fsSL --retry 5 --retry-delay 2 \
         -o /tmp/references.json.gz \
         https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/main/resources/references.json.gz && \
     gunzip -f /tmp/references.json.gz && \
-    /usr/local/bin/preprocess /tmp/references.json /data/vectors.bin /data/labels.bin /data/ivf.bin && \
+    /usr/local/bin/preprocess /tmp/references.json /data/vectors.bin /data/labels.bin /data/residuals.bin /data/ivf.bin && \
     rm -f /tmp/references.json
 
 # Compile the Zig vector core. -mcpu=haswell unlocks AVX2 + FMA + F16C, which
@@ -67,6 +67,7 @@ RUN adduser -D -H -u 10001 app
 COPY --from=build /out/rinha /app/rinha
 COPY --from=build /data/vectors.bin /data/vectors.bin
 COPY --from=build /data/labels.bin /data/labels.bin
+COPY --from=build /data/residuals.bin /data/residuals.bin
 COPY --from=build /data/ivf.bin /data/ivf.bin
 
 RUN chown -R app:app /data
