@@ -6,8 +6,8 @@ const D: usize = 14;
 const K: usize = 5;
 const VLEN: usize = 16;
 const AVX2_LANES: usize = 8;
-const MAX_NPROBE: usize = 128;
-const MAX_CLUSTERS: usize = 8192;
+const MAX_NPROBE: usize = 24;
+const MAX_CLUSTERS: usize = 4096;
 const IVF_MAGIC = "RIVF2026";
 
 const Vec32 = @Vector(AVX2_LANES, f32);

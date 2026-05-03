@@ -15,7 +15,7 @@ case "$MODE" in
     ;;
   full)
     cd "$OFFICIAL_DIR"
-    K6_NO_USAGE_REPORT=true k6 run test/test.js >/dev/null 2>&1
+    K6_WEB_DASHBOARD=true K6_NO_USAGE_REPORT=true k6 run test/test.js >/dev/null 2>&1
     cat test/results.json
     ;;
   *)
