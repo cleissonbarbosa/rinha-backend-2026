@@ -8,12 +8,12 @@ def BACKEND_PORT: u16 = 8080;
 def BACKLOG: u32 = 16384;
 
 def MAX_PAIRS: size = 512;
-def REQ_BUF_SIZE: size = 4096;
-def RESP_BUF_SIZE: size = 1024;
+def REQ_BUF_SIZE: size = 2048;
+def RESP_BUF_SIZE: size = 512;
 def EVENTS_CAP: int = 256;
 
-
 def TCP_NODELAY: int = 1;
+def TCP_DEFER_ACCEPT: int = 9;
 
 const API1_ADDR: ip::addr4 = [172, 30, 0, 11];
 const API2_ADDR: ip::addr4 = [172, 30, 0, 12];
@@ -59,10 +59,8 @@ let epfd: int = -1;
 let listener_fd: int = -1;
 let next_backend: u8 = 0;
 
-
-
-
 def KEY_LISTENER: u32 = 0xFFFFFFFF;
+def ET_EVENTS: u32 = rt::EPOLLIN | rt::EPOLLOUT | rt::EPOLLRDHUP | rt::EPOLLET;
 
 fn key_client(idx: size) u32 = ((idx << 1) | 0): u32;
 fn key_backend(idx: size) u32 = ((idx << 1) | 1): u32;
@@ -95,21 +93,16 @@ fn release_pair(idx: size) void = {
 	free_top += 1;
 };
 
-fn set_nodelay(fd: int) void = {
-	let one: int = 1;
-	match (rt::setsockopt(fd, rt::IPPROTO_TCP, TCP_NODELAY,
-			&one: *opaque, size(int): u32)) {
-	case int => void;
-	case rt::errno => void;
-	};
-};
-
 fn set_sockopt_int(fd: int, level: int, opt: int, val: int) void = {
 	let v = val;
 	match (rt::setsockopt(fd, level, opt, &v: *opaque, size(int): u32)) {
 	case int => void;
 	case rt::errno => void;
 	};
+};
+
+fn set_nodelay(fd: int) void = {
+	set_sockopt_int(fd, rt::IPPROTO_TCP, TCP_NODELAY, 1);
 };
 
 fn epoll_add(fd: int, events: u32, key: u32) bool = {
@@ -123,15 +116,6 @@ fn epoll_add(fd: int, events: u32, key: u32) bool = {
 	};
 };
 
-fn epoll_mod(fd: int, events: u32, key: u32) void = {
-	let ev = rt::epoll_event {
-		events = events,
-		data = rt::epoll_data { u32_ = key },
-	};
-	rt::epoll_ctl(epfd, rt::EPOLL_CTL_MOD, fd, &ev): void;
-};
-
-
 fn header_end(buf: []u8, used: size) (size | void) = {
 	if (used < 4) return void;
 	let limit = used - 3;
@@ -142,7 +126,6 @@ fn header_end(buf: []u8, used: size) (size | void) = {
 		};
 	};
 };
-
 
 fn content_length(buf: []u8, header_len: size) size = {
 	const tag: [15]u8 = ['c', 'o', 'n', 't', 'e', 'n', 't', '-',
@@ -186,6 +169,7 @@ fn open_backend_nonblock(addr: ip::addr4) (int | void) = {
 	case let f: int => yield f;
 	case rt::errno => return void;
 	};
+	set_nodelay(fd);
 	let sa = ip::to_native(addr, BACKEND_PORT);
 	match (rt::connect(fd, &sa, size(rt::sockaddr): u32)) {
 	case void => void;
@@ -195,36 +179,7 @@ fn open_backend_nonblock(addr: ip::addr4) (int | void) = {
 			return void;
 		};
 	};
-	set_nodelay(fd);
 	return fd;
-};
-
-
-
-fn rearm(p: *pair, idx: size) void = {
-	switch (p.state) {
-	case cstate::BK_CONNECTING =>
-		epoll_mod(p.backend_fd,
-			rt::EPOLLOUT | rt::EPOLLRDHUP, key_backend(idx));
-		epoll_mod(p.client_fd, rt::EPOLLRDHUP, key_client(idx));
-	case cstate::READ_REQ =>
-		epoll_mod(p.client_fd,
-			rt::EPOLLIN | rt::EPOLLRDHUP, key_client(idx));
-		epoll_mod(p.backend_fd, rt::EPOLLRDHUP, key_backend(idx));
-	case cstate::WRITE_REQ =>
-		epoll_mod(p.client_fd, rt::EPOLLRDHUP, key_client(idx));
-		epoll_mod(p.backend_fd,
-			rt::EPOLLOUT | rt::EPOLLRDHUP, key_backend(idx));
-	case cstate::READ_RESP =>
-		epoll_mod(p.client_fd, rt::EPOLLRDHUP, key_client(idx));
-		epoll_mod(p.backend_fd,
-			rt::EPOLLIN | rt::EPOLLRDHUP, key_backend(idx));
-	case cstate::WRITE_RESP =>
-		epoll_mod(p.client_fd,
-			rt::EPOLLOUT | rt::EPOLLRDHUP, key_client(idx));
-		epoll_mod(p.backend_fd, rt::EPOLLRDHUP, key_backend(idx));
-	case => void;
-	};
 };
 
 fn drive_write(fd: int, buf: []u8, pos: size, total: size) (size | void) = {
@@ -245,7 +200,7 @@ fn drive_read(fd: int, buf: []u8, used: size) (size | void) = {
 	for (used < len(buf)) {
 		match (rt::read(fd, &buf[used]: *opaque, len(buf) - used)) {
 		case let n: size =>
-			if (n == 0) return void;  
+			if (n == 0) return void;
 			used += n;
 		case let e: rt::errno =>
 			if (e == rt::EAGAIN) return used;
@@ -294,12 +249,13 @@ fn handle_listener() void = {
 		p.backend_fd = bfd;
 		p.state = cstate::BK_CONNECTING;
 
-		if (!epoll_add(cfd, rt::EPOLLRDHUP, key_client(idx))) {
+		// Register both fds once with edge-triggered events.
+		// No further epoll_ctl calls are needed for state transitions.
+		if (!epoll_add(cfd, ET_EVENTS, key_client(idx))) {
 			release_pair(idx);
 			continue;
 		};
-		if (!epoll_add(bfd, rt::EPOLLOUT | rt::EPOLLRDHUP,
-				key_backend(idx))) {
+		if (!epoll_add(bfd, ET_EVENTS, key_backend(idx))) {
 			release_pair(idx);
 			continue;
 		};
@@ -314,9 +270,7 @@ fn try_write_req(p: *pair, idx: size) void = {
 		if (pos == p.req_total) {
 			p.state = cstate::READ_RESP;
 			p.resp_used = 0; p.resp_total = 0;
-			rearm(p, idx);
-		} else {
-			rearm(p, idx);
+			try_read_resp(p, idx);
 		};
 	case void =>
 		release_pair(idx);
@@ -341,10 +295,7 @@ fn try_read_resp(p: *pair, idx: size) void = {
 		if (p.resp_total > 0 && p.resp_used >= p.resp_total) {
 			p.state = cstate::WRITE_RESP;
 			p.resp_pos = 0;
-			rearm(p, idx);
 			try_write_resp(p, idx);
-		} else {
-			rearm(p, idx);
 		};
 	case void =>
 		release_pair(idx);
@@ -357,8 +308,6 @@ fn try_write_resp(p: *pair, idx: size) void = {
 	case let pos: size =>
 		p.resp_pos = pos;
 		if (pos == p.resp_total) {
-			
-			
 			let leftover: size = 0;
 			if (p.req_used > p.req_total) {
 				leftover = p.req_used - p.req_total;
@@ -375,10 +324,13 @@ fn try_write_resp(p: *pair, idx: size) void = {
 			p.resp_total = 0;
 			p.resp_pos = 0;
 			p.state = cstate::READ_REQ;
-			rearm(p, idx);
-			if (leftover > 0) try_read_req(p, idx);
-		} else {
-			rearm(p, idx);
+			if (leftover > 0) {
+				try_read_req(p, idx);
+			} else {
+				// Proactively read any data already buffered
+				// (likely none, but safe with edge-triggered).
+				try_read_req(p, idx);
+			};
 		};
 	case void =>
 		release_pair(idx);
@@ -403,10 +355,7 @@ fn try_read_req(p: *pair, idx: size) void = {
 		if (p.req_total > 0 && p.req_used >= p.req_total) {
 			p.state = cstate::WRITE_REQ;
 			p.req_pos = 0;
-			rearm(p, idx);
 			try_write_req(p, idx);
-		} else {
-			rearm(p, idx);
 		};
 	case void =>
 		release_pair(idx);
@@ -428,7 +377,10 @@ fn handle_pair(idx: size, side_backend: bool, events: u32) void = {
 			if (events & rt::EPOLLRDHUP != 0) release_pair(idx);
 			return;
 		};
-		
+		if (events & rt::EPOLLOUT == 0) {
+			if (events & rt::EPOLLRDHUP != 0) release_pair(idx);
+			return;
+		};
 		let so_err: int = 0;
 		let sl: u32 = size(int): u32;
 		match (rt::getsockopt(p.backend_fd, rt::SOL_SOCKET,
@@ -443,9 +395,8 @@ fn handle_pair(idx: size, side_backend: bool, events: u32) void = {
 			return;
 		};
 		p.state = cstate::READ_REQ;
-		rearm(p, idx);
-		
-		
+		// Drain any data the client may have already sent while we
+		// were waiting for the backend connect to complete.
 		try_read_req(p, idx);
 	case cstate::READ_REQ =>
 		if (side_backend) {
@@ -529,7 +480,6 @@ fn run() void = {
 export fn main() void = {
 	signal::ignore(signal::sig::PIPE);
 
-	
 	for (let i: size = 0; i < MAX_PAIRS; i += 1) {
 		free_stack[i] = (MAX_PAIRS - 1 - i): u32;
 	};
@@ -546,6 +496,10 @@ export fn main() void = {
 	set_sockopt_int(lfd, rt::SOL_SOCKET, rt::SO_REUSEADDR, 1);
 	set_sockopt_int(lfd, rt::SOL_SOCKET, rt::SO_REUSEPORT, 1);
 	set_nodelay(lfd);
+	// TCP_DEFER_ACCEPT: kernel only returns from accept() once data has
+	// arrived, fusing the TCP handshake with the first request and
+	// removing one epoll wakeup per new connection.
+	set_sockopt_int(lfd, rt::IPPROTO_TCP, TCP_DEFER_ACCEPT, 1);
 
 	let sa = ip::to_native(ip::ANY_V4: ip::addr, LISTEN_PORT);
 	match (rt::bind(lfd, &sa, size(rt::sockaddr): u32)) {
