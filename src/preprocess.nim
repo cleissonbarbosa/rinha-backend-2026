@@ -21,12 +21,20 @@ proc envInt(name: string; defaultValue: int): int =
   except ValueError:
     result = defaultValue
 
-const Q16Scale = 8192.0'f64
+const
+  Q16Scale = 32767.0'f64
+  RefineStep = 128
+  RefineScale = Q16Scale * float64(RefineStep)
+  RefineMin = -32767 * RefineStep
+  RefineMax = 32767 * RefineStep
 
-proc f32ToQ16(x: float32): uint16 {.inline.} =
-  let scaled = round(float64(x) * Q16Scale)
-  let clamped = max(-32768.0, min(32767.0, scaled))
-  cast[uint16](int16(clamped))
+proc f32ToRefinedParts(x: float32): tuple[hi: uint16, lo: uint8] {.inline.} =
+  let hiScaled = round(float64(x) * Q16Scale)
+  let hi32 = int32(max(-32767.0, min(32767.0, hiScaled)))
+  let refinedScaled = round(float64(x) * RefineScale)
+  let refined = int32(max(float64(RefineMin), min(float64(RefineMax), refinedScaled)))
+  let residual = max(-128, min(127, refined - hi32 * RefineStep))
+  (cast[uint16](int16(hi32)), cast[uint8](int8(residual)))
 
 proc q16ToF32(h: uint16): float32 {.inline.} =
   float32(cast[int16](h))
@@ -332,13 +340,14 @@ proc parseNumberFast(s: cstring; n: int; p: var int): float64 =
   sign * v
 
 proc main() =
-  if paramCount() != 4:
-    quit("usage: preprocess <input.json> <vectors.bin> <labels.bin> <ivf.bin>", 1)
+  if paramCount() != 5:
+    quit("usage: preprocess <input.json> <vectors.bin> <labels.bin> <residuals.bin> <ivf.bin>", 1)
 
   let inPath = paramStr(1)
   let outVecPath = paramStr(2)
   let outLblPath = paramStr(3)
-  let outIvfPath = paramStr(4)
+  let outResidualPath = paramStr(4)
+  let outIvfPath = paramStr(5)
   let clusterCount = envInt("IVF_CLUSTERS", DefaultIvfClusters)
   let nprobe = min(clusterCount, min(MaxIvfNProbe, envInt("IVF_NPROBE", DefaultIvfNProbe)))
   let sampleCount = envInt("IVF_SAMPLE", DefaultIvfSample)
@@ -354,8 +363,10 @@ proc main() =
   echo "mapped ", total, " bytes"
 
   var vectors: array[D, seq[uint16]]
+  var residuals: array[D, seq[uint8]]
   for d in 0..<D:
     vectors[d] = newSeqOfCap[uint16](ExpectedN)
+    residuals[d] = newSeqOfCap[uint8](ExpectedN)
   var labels = newSeqOfCap[uint8](ExpectedN)
 
   var p = 0
@@ -379,6 +390,7 @@ proc main() =
 
     var dimIdx = 0
     var currentVec: array[D, uint16]
+    var currentResidual: array[D, uint8]
     var labelByte: uint8 = 0
     var sawVector = false
     var sawLabel = false
@@ -424,7 +436,9 @@ proc main() =
             continue
           let v = parseNumberFast(raw, total, p)
           if dimIdx < D:
-            currentVec[dimIdx] = f32ToQ16(float32(v))
+            let parts = f32ToRefinedParts(float32(v))
+            currentVec[dimIdx] = parts.hi
+            currentResidual[dimIdx] = parts.lo
           inc dimIdx
         sawVector = true
       elif keyLen == 5 and raw[keyStart] == 'l':
@@ -477,6 +491,7 @@ proc main() =
 
     for d in 0..<D:
       vectors[d].add(currentVec[d])
+      residuals[d].add(currentResidual[d])
     labels.add(labelByte)
     inc n
 
@@ -513,6 +528,24 @@ proc main() =
     if written != n * 2:
       quit("short write on vectors.bin", 1)
   outVec.close()
+
+  echo "writing ", outResidualPath, " (", n * D, " bytes)"
+  var outResidual = system.open(outResidualPath, fmWrite)
+  var sortedResidual = newSeq[uint8](n)
+  for d in 0..<D:
+    for c in 0..<clusterCount:
+      positions[c] = int(boundaries[c])
+    var i = 0
+    while i < n:
+      let c = int(assignments[i])
+      let pos = positions[c]
+      sortedResidual[pos] = residuals[d][i]
+      positions[c] = pos + 1
+      inc i
+    let written = outResidual.writeBuffer(addr sortedResidual[0], n)
+    if written != n:
+      quit("short write on residuals.bin", 1)
+  outResidual.close()
 
   echo "writing ", outLblPath, " (", n, " bytes)"
   var outLbl = system.open(outLblPath, fmWrite)
