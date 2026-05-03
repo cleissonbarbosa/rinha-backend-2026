@@ -1,0 +1,19 @@
+FROM alpine:edge AS build
+
+WORKDIR /src
+
+RUN apk add --no-cache hare
+
+COPY lb/lb.ha ./lb.ha
+
+RUN mkdir -p /out && hare build -R -o /out/rinha-lb lb.ha
+
+FROM alpine:edge
+
+RUN adduser -D -H -u 10002 app
+
+COPY --from=build /out/rinha-lb /app/rinha-lb
+
+USER app
+EXPOSE 9999
+ENTRYPOINT ["/app/rinha-lb"]

@@ -1,20 +1,22 @@
 services:
-  haproxy:
-    image: haproxy:3.0-alpine
-    container_name: rinha-haproxy
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
+    image: cleissonb/rinha-backend-2026-hare-lb:0.1.0
+    container_name: rinha-lb
     ports:
       - "9999:9999"
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     depends_on:
       - api1
       - api2
     networks:
-      - rinha
+      rinha:
+        ipv4_address: 172.30.0.10
     deploy:
       resources:
         limits:
-          cpus: "0.50"
+          cpus: "0.20"
           memory: "30MB"
 
   api1:
@@ -28,11 +30,12 @@ services:
       - IVF_PATH=/data/ivf.bin
       - HTTP_THREADS=1
     networks:
-      - rinha
+      rinha:
+        ipv4_address: 172.30.0.11
     deploy:
       resources:
         limits:
-          cpus: "0.25"
+          cpus: "0.40"
           memory: "160MB"
 
   api2:
@@ -46,13 +49,17 @@ services:
       - IVF_PATH=/data/ivf.bin
       - HTTP_THREADS=1
     networks:
-      - rinha
+      rinha:
+        ipv4_address: 172.30.0.12
     deploy:
       resources:
         limits:
-          cpus: "0.25"
+          cpus: "0.40"
           memory: "160MB"
 
 networks:
   rinha:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
