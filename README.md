@@ -4,16 +4,20 @@ Implementação para a [Rinha de Backend 2026](https://github.com/zanfranceschi/
 
 ## Stack
 
-| Camada | Tecnologia | Por quê |
-|---|---|---|
-| Load balancer | Custom (hare) | evitar overhead de proxies genéricos.. |
-| API ×2 | Nim + httpbeast | parser JSON manual, FFI direto p/ Zig |
-| vector core | Zig 0.13 | k-NN sobre índice IVF com SIMD AVX2/FMA/F16C |
-| Dataset | `references.json.gz` | baixado no build e convertido para `vectors.bin`, `labels.bin` e `ivf.bin` |
+| Camada        | Tecnologia           | Por quê                                                                  |
+| ------------- | -------------------- | ------------------------------------------------------------------------ |
+| Load balancer | Custom (hare)        | evitar overhead de proxies genéricos..                                   |
+| API ×2        | Nim + httpbeast      | parser JSON manual, FFI direto p/ Zig                                    |
+| vector core   | Zig 0.13             | k-NN sobre índice IVF com SIMD AVX2/FMA/F16C                             |
+| Dataset       | `references.json.gz` | convertido para `vectors.bin`, `labels.bin`, `residuals.bin` e `ivf.bin` |
 
-## test
+## Test
 
 ```bash
 docker compose up -d --build
 curl -fsS http://localhost:9999/ready
 ```
+
+## Documentação
+
+- [Ideia](docs/ideia.md).
